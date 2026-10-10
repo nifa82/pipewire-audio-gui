@@ -1,0 +1,116 @@
+{
+    "id": "com.github.nifa82.PipeWireAudioGui",
+    "runtime": "org.freedesktop.Platform",
+    "runtime-version": "25.08",
+    "sdk": "org.freedesktop.Sdk",
+    "command": "pipewire-audio-gui",
+    "finish-args": [
+        "--socket=pulseaudio",
+        "--filesystem=xdg-run/pipewire-0",
+        "--socket=session-bus",
+        "--socket=wayland",
+        "--socket=x11",
+        "--socket=fallback-x11",
+        "--device=dri",
+        "--share=ipc",
+        "--share=network",
+        "--filesystem=xdg-config/pipewire:create",
+        "--filesystem=xdg-config/wireplumber:create",
+        "--env=PYTHONUNBUFFERED=1"
+    ],
+    "cleanup": [
+        "/include",
+        "/lib/pkgconfig",
+        "/share/man",
+        "/share/doc",
+        "/share/gtk-doc",
+        "*.la",
+        "*.a"
+    ],
+    "modules": [
+        {
+            "name": "pipewire",
+            "buildsystem": "meson",
+            "config-opts": [
+                "-Ddocdir=no-doc",
+                "-Ddocs=disabled",
+                "-Dman=disabled",
+                "-Dexamples=disabled",
+                "-Dtests=disabled",
+                "-Dinstalled_tests=disabled",
+                "-Dgstreamer=disabled",
+                "-Dalsa=disabled",
+                "-Dbluez5=disabled",
+                "-Dvulkan=disabled",
+                "-Dx11=disabled",
+                "-Dlibcamera=disabled",
+                "-Ddbus=disabled",
+                "-Dv4l2=disabled",
+                "-Djack=disabled",
+                "-Dsystemd-system-service=disabled",
+                "-Dsystemd-user-service=disabled",
+                "-Dsdl2=disabled",
+                "-Dsndfile=disabled",
+                "-Dlibpulse=disabled",
+                "-Dsession-managers=",
+                "-Dflatpak=disabled"
+            ],
+            "sources": [
+                {
+                    "type": "archive",
+                    "url": "https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.9/pipewire-1.6.9.tar.bz2",
+                    "sha256": "0cde58c124825bad462b32ab79f9aa286ee7b113cc73a5cda923a4365e752657"
+                }
+            ]
+        },
+        {
+            "name": "pygobject",
+            "buildsystem": "meson",
+            "config-opts": [
+                "-Dpycairo=disabled",
+                "-Dtests=false",
+                "-Dwheel=false"
+            ],
+            "sources": [
+                {
+                    "type": "archive",
+                    "url": "https://download.gnome.org/sources/pygobject/3.58/pygobject-3.58.1.tar.gz",
+                    "sha256": "4c80598ade17fbaa7798e01a25d0bf29ce109740786026a074c5c62bb3e79d23"
+                }
+            ]
+        },
+        {
+            "name": "pipewire-audio-gui",
+            "buildsystem": "simple",
+            "build-commands": [
+                "install -Dm0755 pipewire-audio-gui.py /app/bin/pipewire-audio-gui",
+                "install -Dm0644 pipewire_eq.py /app/bin/pipewire_eq.py",
+                "install -Dm0644 pipewire-audio-gui.desktop /app/share/applications/com.github.nifa82.PipeWireAudioGui.desktop",
+                "install -Dm0644 pipewire-audio-gui.svg /app/share/icons/hicolor/scalable/apps/com.github.nifa82.PipeWireAudioGui.svg",
+                "install -Dm0644 pipewire-audio-gui.metainfo.xml /app/share/metainfo/com.github.nifa82.PipeWireAudioGui.metainfo.xml"
+            ],
+            "sources": [
+                {
+                    "type": "file",
+                    "path": "pipewire-audio-gui.py"
+                },
+                {
+                    "type": "file",
+                    "path": "pipewire_eq.py"
+                },
+                {
+                    "type": "file",
+                    "path": "pipewire-audio-gui.desktop"
+                },
+                {
+                    "type": "file",
+                    "path": "pipewire-audio-gui.svg"
+                },
+                {
+                    "type": "file",
+                    "path": "pipewire-audio-gui.metainfo.xml"
+                }
+            ]
+        }
+    ]
+}

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>pipewire-audio-gui</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>PipeWire Audio Settings</name>
+  <summary>Change PipeWire sample rate and bit depth</summary>
+  <description>
+    <p>
+      A GTK3 tool for controlling audio sample rate and bit depth on PipeWire.
+    </p>
+    <ul>
+      <li>Manual sample rate control with Auto (bit-perfect) and Fixed modes</li>
+      <li>Per-rate mapping: send each input rate bit-perfect or rescale it up/down</li>
+      <li>Upscale below 44.1 kHz and downscale above 192 kHz (8 kHz to 384 kHz)</li>
+      <li>Background auto-apply via a system tray icon that reacts to input rate changes</li>
+      <li>Per-device bit depth (S16LE, S24LE, S24_32LE, S32LE) through WirePlumber rules</li>
+      <li>Shows which rates and formats each output device supports</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">pipewire-audio-gui.desktop</launchable>
+  <categories>
+    <category>Settings</category>
+    <category>AudioVideo</category>
+  </categories>
+  <provides>
+    <binary>pipewire-audio-gui</binary>
+  </provides>
+  <releases>
+    <release version="1.0.0" date="2026-10-10">
+      <description>
+        <p>Initial release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

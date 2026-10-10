@@ -1,0 +1,1607 @@
+#!/usr/bin/env python3
+"""
+PipeWire Audio Settings - GUI for sample rate and bit depth (GTK3).
+
+Requires: python3-gobject, gtk3, pipewire, pipewire-tools, wireplumber
+
+    python3 pipewire-audio-gui.py
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+
+try:
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, GLib
+except (ImportError, ValueError, AttributeError) as e:
+    sys.stderr.write(
+        "GTK3 (PyGObject) not available: %s\n"
+        "Install python3-gobject and gtk3\n" % e
+    )
+    sys.exit(1)
+
+CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+
+
+PW_CONF_DIR = os.path.join(CONFIG_HOME, "pipewire", "pipewire.conf.d")
+PW_RATE_FILE = os.path.join(PW_CONF_DIR, "99-user-gui.conf")
+
+WP_JSON_DIR = os.path.join(CONFIG_HOME, "wireplumber", "wireplumber.conf.d")
+WP_LUA_DIR = os.path.join(CONFIG_HOME, "wireplumber", "main.lua.d")
+WP_JSON_FILE = os.path.join(WP_JSON_DIR, "51-user-device-format.conf")
+WP_LUA_FILE = os.path.join(WP_LUA_DIR, "51-user-device-format.lua")
+
+APP_DIR = os.path.join(CONFIG_HOME, "pipewire-audio-gui")
+MAPPING_FILE = os.path.join(APP_DIR, "mapping.json")
+
+RATES = [8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
+AUTO_RATES = [44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
+
+BITPERFECT = "bitperfect"
+ACTION_BITPERFECT = "bp"
+ACTION_RESCALE = "rs"
+
+MODES = [
+    ("auto", "Auto / bit-perfect (switch to match input stream)"),
+    ("fixed", "Fixed (resample everything to one rate)"),
+]
+
+FORMATS = [
+    ("", "Default (auto-negotiated)"),
+    ("S16LE", "S16LE - 16-bit integer (2 bytes/sample)"),
+    ("S24LE", "S24LE - 24-bit integer, packed (3 bytes/sample)"),
+    ("S24_32LE", "S24_32LE - 24 valid bits in a 32-bit container"),
+    ("S32LE", "S32LE - 32-bit integer (4 bytes/sample)"),
+    ("F32LE", "F32LE - 32-bit float (PipeWire default)"),
+]
+
+RATE_LABELS = [("", "Auto")] + [(str(r), "%dHz" % r) for r in RATES]
+
+# Rates worth calling out in the device summary, in display order.
+COMMON_RATES = (44100, 48000, 88200, 96000)
+
+
+def run(cmd, timeout=20):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except FileNotFoundError:
+        return 127, "", "command not found: %s" % cmd[0]
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out: %s" % " ".join(cmd)
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def get_props(obj):
+    info = obj.get("info")
+    if isinstance(info, dict) and isinstance(info.get("props"), dict):
+        return info["props"]
+    props = obj.get("props")
+    return props if isinstance(props, dict) else {}
+
+
+def get_params(obj):
+    info = obj.get("info")
+    if isinstance(info, dict) and "params" in info:
+        return info["params"]
+    if "params" in obj:
+        return obj["params"]
+    return None
+
+
+def format_supported_rates(dev):
+    """Device summary: the common rates it supports, then its overall range.
+
+    Rendering as "44100, 48000, 88200, 96000Hz (range 32000-96000)" keeps
+    the line short while still showing that rates between the common ones are
+    accepted natively rather than resampled.
+    """
+    if not dev:
+        return "unknown"
+    common = [r for r in COMMON_RATES if device_accepts_rate(dev, r)]
+    text = ", ".join("%dHz" % r for r in common) if common else ""
+    ranges = dev.get("ranges") or []
+    if ranges:
+        lo = min(r[0] for r in ranges)
+        hi = max(r[1] for r in ranges)
+        span = "%d-%d" % (lo, hi) if hi > lo else str(lo)
+        text = (text + " (range " + span + "Hz)") if text else ("range " + span + "Hz")
+    if not text:
+        discrete = dev.get("rates") or []
+        text = ", ".join("%dHz" % r for r in discrete) if discrete else "unknown"
+    return text
+
+
+def device_accepts_rate(dev, rate):
+    """True if the device can run at `rate` natively.
+
+    Matches both the discrete rates it advertises and its min/max range, so a
+    device offering {default: 48000, min: 32000, max: 96000} correctly
+    reports 44100 and 88200 as bit-perfect.
+    """
+    if not isinstance(rate, int) or rate <= 0:
+        return False
+    if rate in dev.get("rates") or []:
+        return True
+    return any(lo <= rate <= hi for lo, hi in dev.get("ranges") or [])
+
+
+def get_state(obj):
+    """Node state lives in info.state, not in props.
+
+    A suspended/idle node has an empty Format param, so this is what
+    distinguishes "no format negotiated yet" from a parsing failure.
+    """
+    info = obj.get("info")
+    if isinstance(info, dict):
+        state = info.get("state")
+        if isinstance(state, str) and state:
+            return state
+    state = get_props(obj).get("node.state")
+    return state if isinstance(state, str) else ""
+
+
+def is_sink(props):
+    media_class = props.get("media.class")
+    if not isinstance(media_class, str):
+        media_class = ""
+    if media_class.startswith("Stream/"):
+        return False
+    if media_class == "Audio/Sink" or media_class.endswith("/Sink"):
+        return True
+    name = props.get("node.name")
+    if not isinstance(name, str):
+        return False
+    return not media_class and name.split(".")[0] in (
+        "alsa_output",
+        "bluez_output",
+        "jack_output",
+        "sndio_output",
+        "v4l2_output",
+    )
+
+
+def as_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def pod_alternatives(value):
+    """Selectable values out of a pw-dump POD description.
+
+    pw-dump renders enumerations as ``{"default": X, "alt1": X, "alt2": X}`` for
+    discrete choices and ``{"default": X, "min": .., "max": .., "step": ..}`` for
+    ranges. Only ``default``/``alt*`` describe values the device can actually be
+    configured to use, so ``min``/``max``/``step`` are deliberately ignored -
+    treating them as supported rates would claim rates the device never offered.
+    """
+    if not isinstance(value, dict):
+        return [value]
+    out = []
+    for key, item in value.items():
+        if key == "default" or key.startswith("alt"):
+            out.extend(pod_alternatives(item))
+    return out or pod_alternatives(value.get("default"))
+
+
+def rate_ranges(obj):
+    """(min, max) sample-rate ranges a device accepts, from EnumFormat.
+
+    pw-dump describes a rate either as discrete choices (``default``/``alt1``/
+    ``alt2``) or as a range (``min``/``max``). A device advertising
+    ``{default: 48000, min: 32000, max: 96000}`` accepts anything in 32000-96000,
+    so a 44100 stream is bit-perfect - not resampled. Only reading ``default``
+    would wrongly report that rate as unsupported.
+    """
+    out = []
+    params = get_params(obj)
+    if isinstance(params, dict):
+        entries = [{"id": key, "info": info} for key, info in params.items()]
+    else:
+        entries = list(params or [])
+    for p in entries:
+        if not isinstance(p, dict) or p.get("id") != "EnumFormat":
+            continue
+        info = p.get("info") or []
+        if isinstance(info, dict):
+            info = [info]
+        for item in info:
+            if not isinstance(item, dict):
+                continue
+            for source in (item.get("audio"), item):
+                if not isinstance(source, dict):
+                    continue
+                rate = source.get("rate")
+                if not isinstance(rate, dict):
+                    continue
+                lo, hi = rate.get("min"), rate.get("max")
+                if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+                    out.append((int(lo), int(hi)))
+    return out
+
+
+def enumerate_audio(obj, param_id):
+    """Yield (format, rate) pairs for a Format/EnumFormat param.
+
+    Handles both shapes pw-dump produces: the flattened ``{"format": ..., "rate":
+    ...}`` entry and the older nested ``{"audio": {...}}`` entry, with plain
+    scalars or ``{default, alt1, ...}`` descriptions.
+    """
+    params = get_params(obj)
+    if isinstance(params, dict):
+        entries = [{"id": key, "info": info} for key, info in params.items()]
+    else:
+        entries = list(params or [])
+    for p in entries:
+        if not isinstance(p, dict) or p.get("id") != param_id:
+            continue
+        info = p.get("info") or []
+        if isinstance(info, dict):
+            info = [info]
+        for item in info:
+            if not isinstance(item, dict):
+                continue
+            sources = []
+            for source in (item.get("audio"), item):
+                if isinstance(source, dict) and ("format" in source or "rate" in source):
+                    sources.append(source)
+            if not sources:
+                continue
+            for source in sources:
+                formats = []
+                for value in pod_alternatives(source.get("format")):
+                    if isinstance(value, str) and value:
+                        formats.append(value)
+                rates = []
+                for value in pod_alternatives(source.get("rate")):
+                    rate = as_int(value)
+                    if rate:
+                        rates.append(rate)
+                if not formats and not rates:
+                    continue
+                for fmt in formats or [None]:
+                    for rate in rates or [None]:
+                        yield fmt, rate
+
+
+def current_format(obj):
+    params = get_params(obj)
+    if isinstance(params, dict):
+        tags = set(params.keys())
+    elif isinstance(params, list):
+        tags = {p.get("id") for p in params if isinstance(p, dict)}
+    else:
+        tags = set()
+    if "Format" not in tags:
+        return None, None
+    for fmt, rate in enumerate_audio(obj, "Format"):
+        if fmt or rate:
+            return fmt, rate
+    return None, None
+
+
+def supported_caps(obj):
+    rates = []
+    formats = []
+    for fmt, rate in enumerate_audio(obj, "EnumFormat"):
+        if rate is not None and rate not in rates:
+            rates.append(rate)
+        if fmt and fmt not in formats:
+            formats.append(fmt)
+    return sorted(rates), formats
+
+
+def format_rate_matrix(obj):
+    """Map each supported format to the rates it can be combined with.
+
+    pw-dump lists format and rate independently inside each EnumFormat entry,
+    so a device advertising S24LE/S16LE alongside rate 32000-96000 accepts every
+    combination - the pairing is a cross product, not a per-rate list. Returns
+    {format: {"rates": [...], "ranges": [(lo, hi), ...]}}.
+    """
+    out = {}
+    params = get_params(obj)
+    if isinstance(params, dict):
+        entries = [{"id": key, "info": info} for key, info in params.items()]
+    else:
+        entries = list(params or [])
+    for p in entries:
+        if not isinstance(p, dict) or p.get("id") != "EnumFormat":
+            continue
+        info = p.get("info") or []
+        if isinstance(info, dict):
+            info = [info]
+        for item in info:
+            if not isinstance(item, dict):
+                continue
+            for source in (item.get("audio"), item):
+                if not isinstance(source, dict):
+                    continue
+                fmts = [v for v in pod_alternatives(source.get("format"))
+                        if isinstance(v, str) and v]
+                rates = [r for r in (as_int(v) for v in pod_alternatives(source.get("rate"))) if r]
+                rng = None
+                rate = source.get("rate")
+                if isinstance(rate, dict):
+                    lo, hi = rate.get("min"), rate.get("max")
+                    if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+                        rng = (int(lo), int(hi))
+                for fmt in fmts:
+                    entry = out.setdefault(fmt, {"rates": [], "ranges": []})
+                    for r in rates:
+                        if r not in entry["rates"]:
+                            entry["rates"].append(r)
+                    if rng and rng not in entry["ranges"]:
+                        entry["ranges"].append(rng)
+    return out
+
+
+def _accepts(rates, ranges, rate):
+    if rate in rates:
+        return True
+    return any(lo <= rate <= hi for lo, hi in ranges)
+
+
+def format_rate_matrix_text(matrix):
+    """Render the format -> rates mapping, e.g.
+    "S16LE: 44100, 48000Hz (range 32000-96000); S24LE: ...".
+    """
+    if not matrix:
+        return "unknown"
+    parts = []
+    for fmt in sorted(matrix):
+        entry = matrix[fmt]
+        common = [r for r in COMMON_RATES if _accepts(entry["rates"], entry["ranges"], r)]
+        if common:
+            text = ", ".join("%dHz" % r for r in common)
+        elif entry["rates"]:
+            text = ", ".join("%dHz" % r for r in entry["rates"])
+        else:
+            text = ""
+        if entry["ranges"]:
+            lo = min(r[0] for r in entry["ranges"])
+            hi = max(r[1] for r in entry["ranges"])
+            span = "%d-%d" % (lo, hi) if hi > lo else str(lo)
+            text = (text + " (range %sHz)" % span) if text else ("range %sHz" % span)
+        parts.append("%s: %s" % (fmt, text))
+    return "; ".join(parts)
+
+
+def load_devices():
+    rc, out, err = run(["pw-dump"])
+    if rc != 0:
+        return [], err or "pw-dump failed"
+    try:
+        data = json.loads(out)
+    except Exception:
+        return [], "could not parse pw-dump output"
+    if not isinstance(data, list):
+        return [], "unexpected pw-dump output (not a list)"
+    devices = []
+    for obj in data:
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "PipeWire:Interface:Node":
+            continue
+        props = get_props(obj)
+        if not is_sink(props):
+            continue
+        fmt, rate = current_format(obj)
+        rates, formats = supported_caps(obj)
+        name = props.get("node.name")
+        if not isinstance(name, str):
+            name = ""
+        desc = (
+            props.get("node.description")
+            or props.get("device.description")
+            or props.get("node.nick")
+            or name
+        )
+        if not isinstance(desc, str):
+            desc = name
+        card = props.get("alsa.card_name")
+        api = props.get("device.api")
+        devices.append(
+            {
+                "id": obj.get("id"),
+                "name": name,
+                "desc": desc,
+                "card": card if isinstance(card, str) else "",
+                "api": api if isinstance(api, str) else "",
+                "state": get_state(obj),
+                "format": fmt or "",
+                "rate": rate or 0,
+                "rates": rates,
+                "ranges": rate_ranges(obj),
+                "formats": formats,
+                "matrix": format_rate_matrix(obj),
+            }
+        )
+    return devices, None
+
+
+def load_streams():
+    rc, out, err = run(["pw-dump"])
+    if rc != 0:
+        return []
+    try:
+        data = json.loads(out)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    streams = []
+    for obj in data:
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "PipeWire:Interface:Node":
+            continue
+        props = get_props(obj)
+        media_class = props.get("media.class")
+        if not isinstance(media_class, str):
+            continue
+        if media_class not in ("Stream/Output/Audio", "Stream/Input/Audio"):
+            continue
+        if props.get("node.virtual"):
+            continue
+        name = props.get("node.name")
+        if not isinstance(name, str):
+            name = ""
+        desc = (
+            props.get("node.description")
+            or props.get("application.process.binary")
+            or props.get("application.name")
+            or name
+        )
+        if not isinstance(desc, str):
+            desc = name
+        rates = sorted({r for _, r in enumerate_audio(obj, "EnumFormat") if r is not None})
+        streams.append({"id": obj.get("id"), "name": name, "desc": desc, "rates": rates})
+    return streams
+
+
+def next_preset(value, direction):
+    if direction > 0:
+        for r in RATES:
+            if r > value:
+                return r
+        return RATES[-1]
+    below = [r for r in RATES if r < value]
+    return below[-1] if below else RATES[0]
+
+
+def default_mapping():
+    return {str(r): BITPERFECT for r in RATES}
+
+
+def load_mapping():
+    mapping = default_mapping()
+    autowatch = False
+    try:
+        with open(MAPPING_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        return mapping, autowatch
+    stored = data.get("rates") if isinstance(data, dict) else None
+    if isinstance(stored, dict):
+        for k, v in stored.items():
+            if v == BITPERFECT:
+                mapping[str(k)] = BITPERFECT
+            else:
+                try:
+                    int(v)
+                except (TypeError, ValueError):
+                    continue
+                mapping[str(k)] = int(v)
+    autowatch = bool(data.get("autowatch")) if isinstance(data, dict) else False
+    return mapping, autowatch
+
+
+def save_mapping(mapping, autowatch):
+    content = json.dumps({"rates": mapping, "autowatch": bool(autowatch)}, indent=2, sort_keys=True)
+    return safe_write(MAPPING_FILE, content + "\n")
+
+
+def resolve_target(input_rate, mapping):
+    action = mapping.get(str(input_rate), BITPERFECT)
+    if action == BITPERFECT:
+        return None
+    try:
+        return int(action)
+    except (TypeError, ValueError):
+        return None
+
+
+def allowed_rates_for(mapping):
+    allowed = set()
+    for key, action in mapping.items():
+        try:
+            src = int(key)
+        except (TypeError, ValueError):
+            continue
+        if action == BITPERFECT:
+            allowed.add(src)
+        else:
+            try:
+                allowed.add(int(action))
+            except (TypeError, ValueError):
+                allowed.add(src)
+    return sorted(allowed)
+
+
+def current_graph_rate():
+    status, _ = load_clock_status()
+    return graph_rate_from(status)
+
+
+def active_input_rate():
+    streams = load_streams()
+    rates = []
+    for s in streams:
+        stream_rates = [r for r in s.get("rates") or [] if isinstance(r, int)]
+        if stream_rates:
+            rates.append(max(stream_rates))
+    if not rates:
+        return 0
+    return max(rates)
+
+
+CLOCK_LINE_RE = re.compile(r"key:'([^']*)' value:'([^']*)'")
+
+
+def parse_clock_value(raw):
+    """Coerce a pw-metadata value into int / list / str.
+
+    ``pw-metadata`` prints every setting as ``key:'name' value:'...'`` with no
+    type annotation, so the type has to be inferred: bare integers become ints,
+    SPA array literals like ``[ 44100, 48000 ]`` become lists, anything else is
+    kept as text.
+    """
+    text = (raw or "").strip()
+    if re.fullmatch(r"-?\d+", text):
+        return int(text)
+    if text.startswith("[") and text.endswith("]"):
+        values = [as_int(x) for x in re.findall(r"-?\d+", text)]
+        values = [v for v in values if v is not None]
+        if values:
+            return values
+    return text
+
+
+def load_clock_status():
+    rc, out, err = run(["pw-metadata", "-n", "settings", "0"])
+    status = {}
+    for line in out.splitlines():
+        m = CLOCK_LINE_RE.search(line)
+        if not m:
+            continue
+        status[m.group(1)] = parse_clock_value(m.group(2))
+    return status, (None if rc == 0 else err)
+
+
+def graph_rate_from(clock):
+    """The rate the graph clock is actually running at.
+
+    ``default.audio.rate`` is only the default handed to *newly created* streams;
+    it does not move an already-running graph. ``clock.rate`` is the live clock,
+    and ``clock.force-rate`` overrides it when set.
+    """
+    for key in ("clock.force-rate", "clock.rate", "default.audio.rate"):
+        value = clock.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    return 0
+
+
+def force_rate(rate):
+    value = str(rate) if rate else "0"
+    return run(["pw-metadata", "-n", "settings", "0", "clock.force-rate", value])
+
+
+def set_default_rate(rate):
+    return run(["pw-metadata", "-n", "settings", "0", "default.audio.rate", str(rate)])
+
+
+def set_allowed_rates(rates):
+    value = "[ " + ", ".join(str(r) for r in rates) + " ]"
+    return run(["pw-metadata", "-n", "settings", "0", "default.audio.allowed-rates", value])
+
+
+def spa_quote(value):
+    text = value if isinstance(value, str) else str(value)
+    text = text.replace("\\", "\\\\").replace('"', '\\"')
+    text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    return '"%s"' % text
+
+
+def lua_quote(value):
+    text = value if isinstance(value, str) else str(value)
+    text = text.replace("\\", "\\\\").replace('"', '\\"')
+    text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    return '"%s"' % text
+
+
+def safe_write(path, content):
+    directory = os.path.dirname(path)
+    try:
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+        return True, path, ""
+    except OSError as e:
+        return False, path, str(e)
+
+
+def remove_file(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def write_rate_config(mode, rate=48000):
+    if mode == "fixed":
+        rates = [rate]
+    else:
+        rates = [r for r in AUTO_RATES]
+        if rate not in rates:
+            rates.append(rate)
+            rates.sort()
+        rate = 48000
+    allowed_str = " ".join(str(r) for r in rates)
+    content = (
+        "context.properties = {\n"
+        "    default.clock.rate          = %d\n"
+        "    default.clock.allowed-rates = [ %s ]\n"
+        "}\n" % (rate, allowed_str)
+    )
+    return safe_write(PW_RATE_FILE, content)
+
+
+def read_rate_config():
+    text = read_file(PW_RATE_FILE)
+    if not text:
+        return None, 0
+    m = re.search(r"default\.clock\.rate\s*=\s*(\d+)", text)
+    rate = int(m.group(1)) if m else 0
+    m = re.search(r"default\.clock\.allowed-rates\s*=\s*\[([^\]]*)\]", text)
+    rates = [int(x) for x in re.findall(r"\d+", m.group(1))] if m else []
+    if len(rates) <= 1:
+        return "fixed", rate
+    return "auto", rate
+
+
+def apply_rate_runtime(mode, rate):
+    results = [("release force-rate", force_rate(None))]
+    results.append(("default.audio.rate", set_default_rate(rate)))
+    if mode == "fixed":
+        results.append(("force-rate", force_rate(rate)))
+    else:
+        results.append(("allowed-rates", set_allowed_rates(AUTO_RATES)))
+    return results
+
+
+def apply_mapping_runtime(input_rate, mapping):
+    target = resolve_target(input_rate, mapping)
+    if target is None:
+        allowed = allowed_rates_for(mapping)
+        if input_rate not in allowed:
+            allowed = sorted(set(allowed) | {input_rate})
+        return [
+            ("allowed-rates", set_allowed_rates(allowed)),
+            ("default.audio.rate", set_default_rate(input_rate)),
+            ("release force-rate (bit-perfect)", force_rate(None)),
+        ]
+    return [
+        ("default.audio.rate", set_default_rate(target)),
+        ("force-rate %d (from %d)" % (target, input_rate), force_rate(target)),
+    ]
+
+
+def wireplumber_version():
+    for cmd in (["wireplumber", "--version"], ["wireplumber", "-v"]):
+        rc, out, err = run(cmd)
+        text = out or err
+        m = re.search(r"(\d+)\.(\d+)", text or "")
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return 0, 0
+
+
+def wp_config_format():
+    major, minor = wireplumber_version()
+    if (major, minor) >= (0, 5):
+        return "json"
+    return "lua"
+
+
+def write_format_config(device_name, fmt, api="alsa"):
+    if api == "bluez5":
+        section = "monitor.bluez5.rules"
+    else:
+        section = "monitor.alsa.rules"
+    kind = wp_config_format()
+    name = spa_quote(device_name) if kind == "json" else lua_quote(device_name)
+    if kind == "json":
+        content = (
+            "%s = [\n"
+            "    {\n"
+            "        matches = [\n"
+            "            {\n"
+            "                node.name = %s\n"
+            "            }\n"
+            "        ]\n"
+            "        actions = {\n"
+            "            update-props = {\n"
+            "                \"audio.format\" = %s\n"
+            "            }\n"
+            "        }\n"
+            "    }\n"
+            "]\n" % (section, name, spa_quote(fmt))
+        )
+        path = WP_JSON_FILE
+    else:
+        table = section[: -len(".rules")]
+        content = (
+            "%s = %s or {}\n"
+            "%s.rules = %s.rules or {}\n"
+            "%s.rules = %s.rules + {\n"
+            "    {\n"
+            "        matches = {\n"
+            "            {\n"
+            "                { \"node.name\", \"matches\", %s },\n"
+            "            },\n"
+            "        },\n"
+            "        apply_properties = {\n"
+            "            [\"audio.format\"] = %s,\n"
+            "        },\n"
+            "    },\n"
+            "}\n"
+            % (table, table, table, table, table, table, name, lua_quote(fmt))
+        )
+        path = WP_LUA_FILE
+    return safe_write(path, content)
+
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def remove_format_config():
+    removed = []
+    for path in (WP_JSON_FILE, WP_LUA_FILE):
+        if remove_file(path):
+            removed.append(path)
+    return removed
+
+
+def remove_rate_config():
+    return remove_file(PW_RATE_FILE)
+
+
+def restart_services(names):
+    cmd = ["systemctl", "--user", "restart"] + names
+    return run(cmd)
+
+
+class MainWindow(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self, title="PipeWire Audio Settings")
+        self.set_border_width(12)
+        self.set_default_size(760, 700)
+        self.set_resizable(True)
+
+        self.devices = []
+        self.mapping = {}
+        self.autowatch = False
+        self.tray_available = False
+        self.indicator = None
+        self.status_icon = None
+        self.watch_source = None
+        self.watch_check = None
+        self.watch_check_item = None
+        self.device_combo = None
+        self.mode_combo = None
+        self.rate_combo = None
+        self.rate_spin = None
+        self.rate_hint = None
+        self.map_rows = {}
+        self.format_combo = None
+        self.info_label = None
+        self.global_label = None
+        self.streams_label = None
+        self.log_view = None
+        self.loading_mapping = False
+
+        self.mapping, self.autowatch = load_mapping()
+
+        self.build_ui()
+        self.build_mapping_rows()
+        try:
+            self.setup_tray()
+        except Exception as e:
+            self.tray_available = False
+            self.log("Tray unavailable (%s); running window-only." % e)
+        self.refresh()
+        self.watch_source = GLib.timeout_add(2000, self.watcher_tick)
+
+    def build_ui(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.add(outer)
+
+        dev_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dev_box.pack_start(Gtk.Label(label="Output device:", xalign=0), False, False, 0)
+        self.device_combo = Gtk.ComboBoxText()
+        self.device_combo.set_hexpand(True)
+        self.device_combo.connect("changed", self.on_device_changed)
+        dev_box.pack_start(self.device_combo, True, True, 0)
+        refresh_btn = Gtk.Button(label="Refresh")
+        refresh_btn.connect("clicked", lambda w: self.refresh())
+        dev_box.pack_start(refresh_btn, False, False, 0)
+        outer.pack_start(dev_box, False, False, 0)
+
+        self.info_label = Gtk.Label(xalign=0, yalign=0)
+        self.info_label.set_line_wrap(True)
+        self.info_label.set_selectable(True)
+        outer.pack_start(self.info_label, False, False, 0)
+
+        self.global_label = Gtk.Label(xalign=0, yalign=0)
+        self.global_label.set_line_wrap(True)
+        self.global_label.set_selectable(True)
+        outer.pack_start(self.global_label, False, False, 0)
+
+        self.streams_label = Gtk.Label(xalign=0, yalign=0)
+        self.streams_label.set_line_wrap(True)
+        self.streams_label.set_selectable(True)
+        outer.pack_start(self.streams_label, False, False, 0)
+
+        notebook = Gtk.Notebook()
+        notebook.set_vexpand(True)
+        page_rate = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        page_rate.set_border_width(8)
+        page_map = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        page_map.set_border_width(8)
+
+        rate_frame = Gtk.Frame(label="Sample Rate")
+        rate_grid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        rate_grid.set_border_width(8)
+        rate_frame.add(rate_grid)
+        page_rate.pack_start(rate_frame, False, False, 0)
+
+        mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        mode_row.pack_start(Gtk.Label(label="Mode:", xalign=0), False, False, 0)
+        self.mode_combo = Gtk.ComboBoxText()
+        for mid, label in MODES:
+            self.mode_combo.append(mid, label)
+        self.mode_combo.set_active(0)
+        self.mode_combo.connect("changed", self.on_mode_changed)
+        self.mode_combo.set_hexpand(True)
+        mode_row.pack_start(self.mode_combo, True, True, 0)
+        rate_grid.pack_start(mode_row, False, False, 0)
+
+        rate_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        rate_row.pack_start(Gtk.Label(label="Rate (Hz):", xalign=0), False, False, 0)
+        self.rate_spin = Gtk.SpinButton.new_with_range(4000, 768000, 1000)
+        self.rate_spin.set_digits(0)
+        self.rate_spin.set_numeric(True)
+        self.rate_spin.set_value(48000)
+        self.rate_spin.set_width_chars(8)
+        rate_row.pack_start(self.rate_spin, False, False, 0)
+        self.rate_combo = Gtk.ComboBoxText()
+        for rid, label in RATE_LABELS:
+            self.rate_combo.append(rid, label)
+        self.rate_combo.set_active(1)
+        self.rate_combo.connect("changed", self.on_rate_preset)
+        rate_row.pack_start(self.rate_combo, False, False, 0)
+        self.rate_down = Gtk.Button(label="\u25bc Down")
+        self.rate_down.set_tooltip_text("Next lower sample rate")
+        self.rate_down.connect("clicked", lambda w: self.on_rate_step(-1))
+        rate_row.pack_start(self.rate_down, False, False, 0)
+        self.rate_up = Gtk.Button(label="\u25b2 Up")
+        self.rate_up.set_tooltip_text("Next higher sample rate")
+        self.rate_up.connect("clicked", lambda w: self.on_rate_step(1))
+        rate_row.pack_start(self.rate_up, False, False, 0)
+        rate_row.pack_start(Gtk.Label(label=""), True, True, 0)
+        rate_grid.pack_start(rate_row, False, False, 0)
+
+        self.rate_hint = Gtk.Label(xalign=0, yalign=0)
+        self.rate_hint.set_line_wrap(True)
+        rate_grid.pack_start(self.rate_hint, False, False, 0)
+
+        rate_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        apply_now = Gtk.Button(label="Apply Now (runtime)")
+        apply_now.connect("clicked", lambda w: self.on_apply_rate())
+        rate_btns.pack_start(apply_now, False, False, 0)
+        save_rate = Gtk.Button(label="Save & Restart")
+        save_rate.connect("clicked", lambda w: self.on_save_rate())
+        rate_btns.pack_start(save_rate, False, False, 0)
+        reset_rate = Gtk.Button(label="Reset to Defaults")
+        reset_rate.connect("clicked", lambda w: self.on_reset_rate())
+        rate_btns.pack_start(reset_rate, False, False, 0)
+        rate_btns.pack_start(Gtk.Label(label=""), True, True, 0)
+        rate_grid.pack_start(rate_btns, False, False, 0)
+
+        map_frame = Gtk.Frame(label="Per-Rate Mapping (auto)")
+        map_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        map_box.set_border_width(8)
+        map_frame.add(map_box)
+        page_map.pack_start(map_frame, True, True, 0)
+
+        map_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        map_head.pack_start(Gtk.Label(label="Input rate →", xalign=0), False, False, 0)
+        map_head.pack_start(Gtk.Label(label="Send bit-perfect or rescale to another rate:", xalign=0), False, False, 0)
+        map_head.pack_start(Gtk.Label(label=""), True, True, 0)
+        self.watch_check = Gtk.CheckButton(label="Watch in background and apply automatically")
+        self.watch_check.set_active(self.autowatch)
+        self.watch_check.connect("toggled", self.on_autowatch_toggled)
+        map_head.pack_start(self.watch_check, False, False, 0)
+        map_box.pack_start(map_head, False, False, 0)
+
+        map_scroll = Gtk.ScrolledWindow()
+        map_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        map_scroll.set_min_content_height(160)
+        self.map_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        map_scroll.add(self.map_container)
+        map_box.pack_start(map_scroll, True, True, 0)
+
+        map_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        map_apply = Gtk.Button(label="Apply Mapping Now")
+        map_apply.connect("clicked", lambda w: self.on_apply_mapping_now())
+        map_btns.pack_start(map_apply, False, False, 0)
+        map_default = Gtk.Button(label="All Bit-Perfect")
+        map_default.connect("clicked", lambda w: self.on_mapping_default())
+        map_btns.pack_start(map_default, False, False, 0)
+        map_btns.pack_start(Gtk.Label(label=""), True, True, 0)
+        map_box.pack_start(map_btns, False, False, 0)
+
+        fmt_frame = Gtk.Frame(label="Bit Depth")
+        fmt_grid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        fmt_grid.set_border_width(8)
+        fmt_frame.add(fmt_grid)
+        page_rate.pack_start(fmt_frame, False, False, 0)
+
+        fmt_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        fmt_row.pack_start(Gtk.Label(label="Device format:", xalign=0), False, False, 0)
+        self.format_combo = Gtk.ComboBoxText()
+        for fid, label in FORMATS:
+            self.format_combo.append(fid, label)
+        self.format_combo.set_active(0)
+        fmt_row.pack_start(self.format_combo, False, False, 0)
+        fmt_row.pack_start(Gtk.Label(label=""), True, True, 0)
+        fmt_grid.pack_start(fmt_row, False, False, 0)
+
+        fmt_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        save_fmt = Gtk.Button(label="Save for Device")
+        save_fmt.connect("clicked", lambda w: self.on_save_format())
+        fmt_btns.pack_start(save_fmt, False, False, 0)
+        reset_fmt = Gtk.Button(label="Reset Device Format")
+        reset_fmt.connect("clicked", lambda w: self.on_reset_format())
+        fmt_btns.pack_start(reset_fmt, False, False, 0)
+        fmt_btns.pack_start(Gtk.Label(label=""), True, True, 0)
+        fmt_grid.pack_start(fmt_btns, False, False, 0)
+
+        fmt_note = Gtk.Label(
+            label=(
+                "Note: PipeWire mixes internally in 32-bit float. This setting "
+                "changes the sample format your device receives (written as a "
+                "WirePlumber rule) and applies after WirePlumber restarts."
+            ),
+            xalign=0,
+        )
+        fmt_note.set_line_wrap(True)
+        fmt_grid.pack_start(fmt_note, False, False, 0)
+
+
+        log_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        log_page.set_border_width(8)
+
+        log_frame = Gtk.Frame(label="Status / Log")
+        log_frame.set_vexpand(True)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(120)
+        self.log_view = Gtk.TextView()
+        self.log_view.set_editable(False)
+        self.log_view.set_cursor_visible(False)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD)
+        self.log_buffer = self.log_view.get_buffer()
+        scroll.add(self.log_view)
+        log_frame.add(scroll)
+        log_page.pack_start(log_frame, True, True, 0)
+
+        notebook.append_page(page_rate, Gtk.Label(label="Samplerate & Bitrate"))
+        notebook.append_page(page_map, Gtk.Label(label="Samplerate mapping"))
+        notebook.append_page(log_page, Gtk.Label(label="Log"))
+        outer.pack_start(notebook, True, True, 0)
+
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        pw_btn = Gtk.Button(label="Restart PipeWire")
+        pw_btn.connect("clicked", lambda w: self.restart_pipewire())
+        footer.pack_start(pw_btn, False, False, 0)
+        wp_btn = Gtk.Button(label="Restart WirePlumber")
+        wp_btn.connect("clicked", lambda w: self.restart_wireplumber())
+        footer.pack_start(wp_btn, False, False, 0)
+        footer.pack_start(Gtk.Label(label=""), True, True, 0)
+        about_btn = Gtk.Button(label="About")
+        about_btn.connect("clicked", lambda w: self.show_about())
+        footer.pack_start(about_btn, False, False, 0)
+        quit_btn = Gtk.Button(label="Quit")
+        quit_btn.connect("clicked", lambda w: Gtk.main_quit())
+        footer.pack_start(quit_btn, False, False, 0)
+        outer.pack_start(footer, False, False, 0)
+
+    def log(self, text):
+        try:
+            stamp = datetime.now().strftime("%H:%M:%S")
+            end_iter = self.log_buffer.get_end_iter()
+            self.log_buffer.insert(end_iter, "[%s] %s\n" % (stamp, text))
+            self.log_view.scroll_to_iter(end_iter, 0.0, 0.0, 1.0)
+        except Exception:
+            pass
+
+    def show_about(self):
+        dialog = Gtk.AboutDialog()
+        dialog.set_transient_for(self)
+        dialog.set_modal(True)
+        dialog.set_program_name("PipeWire Audio Settings")
+        dialog.set_version("1.0.0")
+        dialog.set_copyright("Copyright © 2026 nifa82")
+        dialog.set_license_type(Gtk.License.MIT_X11)
+        dialog.set_website("https://github.com/nifa82/pipewire-audio-gui")
+        dialog.set_website_label("GitHub")
+        dialog.set_comments(
+            "GTK3 GUI for PipeWire sample rate and bit depth control.\n"
+            "Features:\n"
+            "  • Sample rate control (Auto/Fixed modes)\n"
+            "  • Per-rate mapping (bit-perfect or rescale)\n"
+            "  • Background auto-apply with tray icon\n"
+            "  • Bit depth per device via WirePlumber rules\n"
+            "\n"
+            "Requires: pipewire, pipewire-tools, wireplumber"
+        )
+        dialog.set_authors(["nifa82"])
+        dialog.run()
+        dialog.destroy()
+
+    def save_mapping_quiet(self):
+        ok, path, err = save_mapping(self.mapping, self.autowatch)
+        if not ok:
+            self.log("Could not save mapping to %s: %s" % (path, err))
+        return ok
+
+    def refresh(self):
+        self.devices, err = load_devices()
+        if err:
+            self.log("pw-dump error: %s" % err)
+        self.device_combo.remove_all()
+        for i, dev in enumerate(self.devices):
+            if dev["format"] and dev["rate"]:
+                state = "%s @ %dHz" % (dev["format"], dev["rate"])
+            else:
+                state = "not negotiated (%s)" % (dev["state"] or "idle")
+            label = "%s  (%s)" % (dev["desc"], state)
+            self.device_combo.append(dev["name"], label)
+        if self.devices:
+            self.device_combo.set_active(0)
+        else:
+            self.info_label.set_text(
+                "No audio output devices found.\nerror: %s" % (err or "empty pw-dump output")
+            )
+        self.refresh_streams()
+        self.update_global_label()
+        self.restore_mode_state()
+
+    def restore_mode_state(self):
+        mode, rate = read_rate_config()
+        if mode == "fixed":
+            self.mode_combo.set_active_id("fixed")
+            if rate:
+                self.rate_spin.set_value(rate)
+        else:
+            self.mode_combo.set_active_id("auto")
+        self.on_mode_changed(self.mode_combo)
+
+    def refresh_streams(self):
+        streams = load_streams()
+        dev = self.selected_device()
+        if not streams:
+            self.streams_label.set_text("Active input streams: none detected.")
+            return
+        lines = ["Active input streams:"]
+        for s in streams:
+            rates = ", ".join("%dHz" % r for r in s["rates"]) if s["rates"] else "rate n/a"
+            note = ""
+            if dev and dev["rates"] and s["rates"]:
+                direct = [r for r in s["rates"] if device_accepts_rate(dev, r)]
+                if direct:
+                    note = "  |  device supports: %s (direct/bit-perfect)" % ", ".join(
+                        "%dHz" % r for r in direct
+                    )
+                else:
+                    note = "  |  device does not support these rates -> resampled"
+            lines.append("  %s  [%s]%s" % (s["desc"], rates, note))
+        self.streams_label.set_text("\n".join(lines))
+
+    def update_global_label(self):
+        status, err = load_clock_status()
+        if err:
+            self.global_label.set_text("Could not read clock settings: %s" % err)
+            return
+        force = status.get("clock.force-rate", 0)
+        if not isinstance(force, int):
+            force = 0
+        default = graph_rate_from(status)
+        mode, saved_rate = read_rate_config()
+        if force > 0:
+            state = "forced to %dHz" % force
+        elif mode == "auto":
+            state = "auto / bit-perfect switching"
+        elif mode == "fixed":
+            state = "fixed, resample to %dHz (saved)" % saved_rate
+        else:
+            state = "automatic (not forced)"
+        self.global_label.set_text(
+            "Global clock: %s | clock.rate = %dHz" % (state, default)
+        )
+
+    def on_rate_preset(self, combo):
+        rid = combo.get_active_id()
+        if rid and rid != "":
+            self.rate_spin.set_value(int(rid))
+
+    def spin_rate(self):
+        try:
+            return int(self.rate_spin.get_value())
+        except (TypeError, ValueError):
+            return 48000
+
+    def on_rate_step(self, direction):
+        cur = self.spin_rate()
+        nxt = next_preset(cur, direction)
+        self.rate_spin.set_value(nxt)
+        self.rate_combo.set_active_id(str(nxt))
+
+    def build_mapping_rows(self):
+        for child in self.map_container.get_children():
+            self.map_container.remove(child)
+        self.map_rows = {}
+        self.loading_mapping = True
+        for rate in RATES:
+            key = str(rate)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            row.pack_start(Gtk.Label(label="%7dHz" % rate, xalign=0), False, False, 0)
+
+            action = Gtk.ComboBoxText()
+            action.append(ACTION_BITPERFECT, "bit-perfect")
+            action.append(ACTION_RESCALE, "rescale to")
+            action.connect("changed", self.on_map_action_changed, key)
+            row.pack_start(action, False, False, 0)
+
+            target = Gtk.ComboBoxText()
+            for t in RATES:
+                target.append(str(t), "%dHz" % t)
+            target.connect("changed", self.on_map_target_changed, key)
+            row.pack_start(target, False, False, 0)
+
+            action_value = self.mapping.get(key, BITPERFECT)
+            if action_value == BITPERFECT:
+                action.set_active_id(ACTION_BITPERFECT)
+                target.set_active_id(key)
+                target.set_sensitive(False)
+            else:
+                action.set_active_id(ACTION_RESCALE)
+                target.set_active_id(str(action_value))
+                target.set_sensitive(True)
+
+            self.map_container.pack_start(row, False, False, 0)
+            self.map_rows[key] = (action, target)
+        self.loading_mapping = False
+
+    def refresh_mapping_rows(self):
+        for key, (action, target) in self.map_rows.items():
+            self.loading_mapping = True
+            value = self.mapping.get(key, BITPERFECT)
+            if value == BITPERFECT:
+                action.set_active_id(ACTION_BITPERFECT)
+                target.set_active_id(key)
+                target.set_sensitive(False)
+            else:
+                action.set_active_id(ACTION_RESCALE)
+                target.set_active_id(str(value))
+                target.set_sensitive(True)
+            self.loading_mapping = False
+
+    def on_map_action_changed(self, combo, key):
+        if self.loading_mapping:
+            return
+        aid = combo.get_active_id()
+        if aid == ACTION_BITPERFECT:
+            self.mapping[key] = BITPERFECT
+            action, target = self.map_rows[key]
+            target.set_sensitive(False)
+        else:
+            current = self.mapping.get(key)
+            if current == BITPERFECT or current is None:
+                current = int(next_preset(int(key), 1))
+            self.mapping[key] = current
+            action, target = self.map_rows[key]
+            target.set_active_id(str(current))
+            target.set_sensitive(True)
+        self.save_mapping_quiet()
+        self.log("Mapping %sHz -> %s" % (key, self.mapping[key]))
+        if self.autowatch:
+            self.watcher_tick()
+
+    def on_map_target_changed(self, combo, key):
+        if self.loading_mapping:
+            return
+        tid = combo.get_active_id()
+        if not tid:
+            return
+        self.mapping[key] = int(tid)
+        self.save_mapping_quiet()
+        self.log("Mapping %sHz -> resample to %sHz" % (key, tid))
+        if self.autowatch:
+            self.watcher_tick()
+
+    def on_mapping_default(self):
+        self.mapping = default_mapping()
+        self.save_mapping_quiet()
+        self.refresh_mapping_rows()
+        self.log("Mapping reset: all rates bit-perfect.")
+        if self.autowatch:
+            self.watcher_tick()
+
+    def on_apply_mapping_now(self):
+        rate = active_input_rate()
+        if not rate:
+            self.log("No active input stream detected; mapping not applied.")
+            self.update_global_label()
+            self.refresh_streams()
+            return
+        target = resolve_target(rate, self.mapping)
+        if target is None:
+            self.log("Input %dHz -> bit-perfect." % rate)
+        else:
+            self.log("Input %dHz -> rescale to %dHz." % (rate, target))
+        for label, (rc, out, err) in apply_mapping_runtime(rate, self.mapping):
+            if rc == 0:
+                self.log("%s ok." % label)
+            else:
+                self.log("%s failed: %s" % (label, err or out))
+        self.update_global_label()
+        self.refresh_streams()
+
+    def on_autowatch_toggled(self, check):
+        self.autowatch = check.get_active()
+        self.save_mapping_quiet()
+        self.log("Background auto-apply %s." % ("enabled" if self.autowatch else "disabled"))
+        if self.tray_available and self.watch_check_item is not None:
+            self.watch_check_item.set_active(self.autowatch)
+        if self.autowatch:
+            self.watcher_tick()
+
+    def watcher_tick(self):
+        if not self.autowatch:
+            return True
+        rate = active_input_rate()
+        if not rate:
+            return True
+        target = resolve_target(rate, self.mapping)
+        current = current_graph_rate()
+        if target is None:
+            allowed = allowed_rates_for(self.mapping)
+            if rate not in allowed:
+                allowed = sorted(set(allowed) | {rate})
+                set_allowed_rates(allowed)
+            if current != rate:
+                set_default_rate(rate)
+                force_rate(None)
+                self.log("Auto: input %dHz -> bit-perfect." % rate)
+        else:
+            if current != target:
+                set_default_rate(target)
+                force_rate(target)
+                self.log("Auto: input %dHz -> rescaled to %dHz." % (rate, target))
+        return True
+
+    def setup_tray(self):
+        try:
+            gi.require_version("AyatanaAppIndicator3", "0.1")
+            from gi.repository import AyatanaAppIndicator3 as AppIndicator
+        except Exception:
+            self.log(
+                "AppIndicator typelib not found; using StatusIcon "
+                "(on Wayland there is no fallback - install libappindicator3-1)."
+            )
+            AppIndicator = None
+
+        menu = Gtk.Menu()
+        show_item = Gtk.MenuItem(label="Show / Hide")
+        show_item.connect("activate", lambda w: self.toggle_window())
+        menu.append(show_item)
+        self.watch_check_item = Gtk.CheckMenuItem(label="Auto-apply mappings")
+        self.watch_check_item.set_active(self.autowatch)
+        self.watch_check_item.connect("toggled", lambda w: self.toggle_autowatch_from_tray())
+        menu.append(self.watch_check_item)
+        reapply_item = Gtk.MenuItem(label="Apply mapping now")
+        reapply_item.connect("activate", lambda w: self.on_apply_mapping_now())
+        menu.append(reapply_item)
+        menu.append(Gtk.SeparatorMenuItem())
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", lambda w: Gtk.main_quit())
+        menu.append(quit_item)
+        menu.show_all()
+
+        if AppIndicator is not None:
+            try:
+                self.indicator = AppIndicator.Indicator.new(
+                    "pipewire-audio-gui", "audio-volume-high", AppIndicator.IndicatorCategory.HARDWARE
+                )
+                self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+                self.indicator.set_menu(menu)
+                self.tray_available = True
+                self.log("Tray icon active (AppIndicator).")
+                return
+            except Exception as e:
+                self.log("AppIndicator failed (%s); using StatusIcon." % e)
+
+        try:
+            self.status_icon = Gtk.StatusIcon.new_from_icon_name("audio-volume-high")
+            self.status_icon.set_tooltip_text("PipeWire Audio Settings")
+            self.status_icon.connect("activate", lambda w: self.toggle_window())
+            self.status_icon.connect("popup-menu", lambda w, b, t: self.popup_status_menu(b, t, 3))
+            self.tray_available = True
+            self.log("Tray icon active (StatusIcon).")
+        except Exception as e:
+            self.log("No tray support (%s); window-only mode." % e)
+            self.tray_available = False
+
+    def popup_status_menu(self, button, time, data=None):
+        menu = Gtk.Menu()
+        show_item = Gtk.MenuItem(label="Show / Hide")
+        show_item.connect("activate", lambda w: self.toggle_window())
+        menu.append(show_item)
+        self.watch_check_item = Gtk.CheckMenuItem(label="Auto-apply mappings")
+        self.watch_check_item.set_active(self.autowatch)
+        self.watch_check_item.connect("toggled", lambda w: self.toggle_autowatch_from_tray())
+        menu.append(self.watch_check_item)
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", lambda w: Gtk.main_quit())
+        menu.append(quit_item)
+        menu.show_all()
+        menu.popup(None, None, None, None, 3, time)
+
+    def toggle_autowatch_from_tray(self):
+        if self.watch_check_item is None:
+            return
+        val = self.watch_check_item.get_active()
+        if self.watch_check is not None and self.watch_check.get_active() != val:
+            self.watch_check.set_active(val)
+        elif self.watch_check is not None and self.watch_check.get_active() == val:
+            self.autowatch = val
+            self.save_mapping_quiet()
+
+    def toggle_window(self):
+        if self.get_visible():
+            self.hide()
+        else:
+            self.show_all()
+            self.present()
+
+    def on_delete_event(self, widget, event):
+        if self.tray_available:
+            self.hide()
+            self.log("Window hidden; still running in the tray.")
+            return True
+        return False
+
+    def on_mode_changed(self, combo):
+        mode = combo.get_active_id() or "auto"
+        is_fixed = mode == "fixed"
+        self.rate_spin.set_sensitive(is_fixed)
+        self.rate_combo.set_sensitive(is_fixed)
+        self.rate_up.set_sensitive(is_fixed)
+        self.rate_down.set_sensitive(is_fixed)
+        if is_fixed:
+            self.rate_hint.set_text(
+                "Everything is resampled to one rate (use up/down to pick). "
+                "Bit-perfect only when the stream already matches this rate."
+            )
+        else:
+            self.rate_hint.set_text(
+                "Bit-perfect: PipeWire switches the output rate to match the input "
+                "stream whenever the device supports it (44.1k-192k). The rate row is "
+                "ignored in this mode."
+            )
+
+    def selected_device(self):
+        name = self.device_combo.get_active_id()
+        for dev in self.devices:
+            if dev["name"] == name:
+                return dev
+        return None
+
+    def on_device_changed(self, combo):
+        dev = self.selected_device()
+        if not dev:
+            self.info_label.set_text("")
+            return
+        rates = format_supported_rates(dev)
+        fmts = ", ".join(dev["formats"]) if dev["formats"] else "unknown"
+        if dev["format"] and dev["rate"]:
+            current = "%s @ %dHz" % (dev["format"], dev["rate"])
+        else:
+            # A suspended node has an empty Format param, so there is nothing
+            # negotiated to report - say so instead of a misleading blank.
+            current = "not negotiated (%s)" % (dev["state"] or "idle")
+        self.info_label.set_text(
+            "Device: %s\nnode.name: %s\ncard: %s\ncurrent format: %s\n"
+            "supported samplerates: %s\nsupported bit depth: %s\nsamplerates per bit depth: %s"
+            % (
+                dev["desc"],
+                dev["name"],
+                dev["card"] or "-",
+                current,
+                rates,
+                fmts,
+                format_rate_matrix_text(dev["matrix"]),
+            )
+        )
+        for fid, _ in FORMATS:
+            if fid == dev["format"]:
+                self.format_combo.set_active_id(fid)
+                break
+        else:
+            self.format_combo.set_active_id("")
+        self.refresh_streams()
+
+    def on_apply_rate(self):
+        mode = self.mode_combo.get_active_id() or "auto"
+        rate = self.spin_rate()
+        for label, (rc, out, err) in apply_rate_runtime(mode, rate):
+            if rc == 0:
+                self.log("%s ok." % label)
+            else:
+                self.log("%s failed: %s" % (label, err or out))
+        self.update_global_label()
+
+    def on_save_rate(self):
+        mode = self.mode_combo.get_active_id() or "auto"
+        try:
+            rate = int(self.rate_spin.get_value())
+        except (TypeError, ValueError):
+            rate = 48000
+        ok, path, werr = write_rate_config(mode, rate)
+        if not ok:
+            self.log("Could not write %s: %s" % (path, werr))
+            return
+        for label, (rc, out, err) in apply_rate_runtime(mode, rate):
+            if rc != 0:
+                self.log("%s failed: %s" % (label, err or out))
+        self.log("Wrote %s (mode=%s, rate=%d)." % (path, mode, rate))
+        rc, out, err = restart_services(["pipewire.service", "pipewire-pulse.service"])
+        if rc == 0:
+            self.log("PipeWire restarted.")
+        else:
+            self.log("PipeWire restart failed: %s" % (err or out))
+        GLib.timeout_add(1500, self.refresh)
+
+    def on_reset_rate(self):
+        force_rate(None)
+        removed = remove_rate_config()
+        if removed:
+            self.log("Removed %s and released force-rate." % PW_RATE_FILE)
+        else:
+            self.log("Released clock.force-rate (runtime).")
+        rc, out, err = restart_services(["pipewire.service", "pipewire-pulse.service"])
+        if rc == 0:
+            self.log("PipeWire restarted.")
+        else:
+            self.log("PipeWire restart failed: %s" % (err or out))
+        GLib.timeout_add(1500, self.refresh)
+
+    def on_save_format(self):
+        dev = self.selected_device()
+        fmt = self.format_combo.get_active_id()
+        if not dev or not fmt:
+            self.log("Select a device and a format first.")
+            return
+        if dev["api"] not in ("alsa", "bluez5"):
+            self.log(
+                "Warning: device.api=%r - format rules are only applied by "
+                "WirePlumber to alsa/bluez5 devices; virtual sinks may ignore this."
+                % dev["api"]
+            )
+        ok, path, werr = write_format_config(dev["name"], fmt, dev["api"])
+        if not ok:
+            self.log("Could not write %s: %s" % (path, werr))
+            return
+        self.log("Wrote %s (device=%s, format=%s)." % (path, dev["name"], fmt))
+        rc, out, err = restart_services(["wireplumber.service"])
+        if rc == 0:
+            self.log("WirePlumber restarted; format should now be %s for %s." % (fmt, dev["desc"]))
+        else:
+            self.log("WirePlumber restart failed: %s" % (err or out))
+        GLib.timeout_add(1500, self.refresh)
+
+    def on_reset_format(self):
+        removed = remove_format_config()
+        if removed:
+            self.log("Removed %s." % ", ".join(removed))
+        else:
+            self.log("No custom format file to remove.")
+        rc, out, err = restart_services(["wireplumber.service"])
+        if rc == 0:
+            self.log("WirePlumber restarted; device format back to automatic.")
+        else:
+            self.log("WirePlumber restart failed: %s" % (err or out))
+        GLib.timeout_add(1500, self.refresh)
+
+    def restart_pipewire(self):
+        rc, out, err = restart_services(["pipewire.service", "pipewire-pulse.service"])
+        self.log("Restart PipeWire: %s" % ("OK" if rc == 0 else (err or out)))
+        GLib.timeout_add(1500, self.refresh)
+
+    def restart_wireplumber(self):
+        rc, out, err = restart_services(["wireplumber.service"])
+        self.log("Restart WirePlumber: %s" % ("OK" if rc == 0 else (err or out)))
+        GLib.timeout_add(1500, self.refresh)
+
+
+def main():
+    if not Gtk.init_check():
+        sys.stderr.write(
+            "Could not initialize GTK: no usable graphical display.\n"
+            "  DISPLAY=%s\n"
+            "  WAYLAND_DISPLAY=%s\n"
+            "Run this from your desktop session (not over a plain SSH console).\n"
+            % (
+                os.environ.get("DISPLAY") or "(unset)",
+                os.environ.get("WAYLAND_DISPLAY") or "(unset)",
+            )
+        )
+        sys.exit(1)
+    win = MainWindow()
+    win.connect("destroy", lambda w: Gtk.main_quit())
+    win.connect("delete-event", win.on_delete_event)
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=PipeWire Audio Settings
+GenericName=Audio Settings
+Comment=Change PipeWire sample rate and bit depth, with per-rate bit-perfect or rescaling
+Exec=pipewire-audio-gui
+TryExec=pipewire-audio-gui
+Icon=pipewire-audio-gui
+Terminal=false
+Categories=Settings;Audio;AudioVideo;Mixer;
+Keywords=pipewire;audio;sound;sample;rate;bit;depth;bitperfect;resample;volume;
+StartupNotify=true
+StartupWMClass=pipewire-audio-gui
+X-GNOME-UsesNotifications=false
