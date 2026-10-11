@@ -84,7 +84,6 @@
             "buildsystem": "simple",
             "build-commands": [
                 "install -Dm0755 pipewire-audio-gui.py /app/bin/pipewire-audio-gui",
-                "install -Dm0644 pipewire_eq.py /app/bin/pipewire_eq.py",
                 "install -Dm0644 pipewire-audio-gui.desktop /app/share/applications/com.github.nifa82.PipeWireAudioGui.desktop",
                 "install -Dm0644 pipewire-audio-gui.svg /app/share/icons/hicolor/scalable/apps/com.github.nifa82.PipeWireAudioGui.svg",
                 "install -Dm0644 pipewire-audio-gui.metainfo.xml /app/share/metainfo/com.github.nifa82.PipeWireAudioGui.metainfo.xml"
@@ -93,10 +92,6 @@
                 {
                     "type": "file",
                     "path": "pipewire-audio-gui.py"
-                },
-                {
-                    "type": "file",
-                    "path": "pipewire_eq.py"
                 },
                 {
                     "type": "file",

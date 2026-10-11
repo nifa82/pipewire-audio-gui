@@ -16,7 +16,7 @@
 
 
 Name:           pipewire-audio-gui
-Version:        1.0.0
+Version:        1.1.0
 Release:        0
 Summary:        Change PipeWire sample rate and bit depth
 
@@ -55,7 +55,6 @@ input sample rate changes.
 %install
 mkdir -p %{buildroot}%{_bindir}
 install -m 0755 pipewire-audio-gui.py %{buildroot}%{_bindir}/pipewire-audio-gui
-install -m 0644 pipewire_eq.py %{buildroot}%{_bindir}/pipewire_eq.py
 
 mkdir -p %{buildroot}%{_datadir}/applications
 install -m 0644 data/pipewire-audio-gui.desktop \
@@ -95,7 +94,6 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/pipewire-audio-gui.de
 %license LICENSE
 %doc README.md
 %{_bindir}/pipewire-audio-gui
-%{_bindir}/pipewire_eq.py
 %{_datadir}/applications/pipewire-audio-gui.desktop
 %{_datadir}/metainfo/pipewire-audio-gui.metainfo.xml
 %{_datadir}/icons/hicolor/scalable/apps/pipewire-audio-gui.svg

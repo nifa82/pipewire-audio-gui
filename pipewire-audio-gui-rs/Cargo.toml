@@ -1,6 +1,6 @@
 [package]
 name = "pipewire-audio-gui"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "GTK4 GUI for PipeWire sample rate and bit depth settings on openSUSE"
 license = "MIT"

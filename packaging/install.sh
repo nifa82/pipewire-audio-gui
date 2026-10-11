@@ -12,7 +12,7 @@
 set -eu
 
 NAME=pipewire-audio-gui
-VERSION=1.0.0
+VERSION=1.1.0
 
 PREFIX=/usr/local
 DESTDIR=
@@ -44,7 +44,8 @@ root="$DESTDIR$PREFIX"
 
 app_src="$here/pipewire-audio-gui.py"
 app_dst="$root/bin/$NAME"
-eq_src="$here/pipewire_eq.py"
+# Legacy EQ helper, removed from the app. Kept here only so uninstalling
+# after an upgrade still cleans up a copy installed by an older version.
 eq_dst="$root/bin/pipewire_eq.py"
 desktop_dst="$root/share/applications/$NAME.desktop"
 metainfo_dst="$root/share/metainfo/$NAME.metainfo.xml"
@@ -77,7 +78,6 @@ if [ "$ACTION" = uninstall ]; then
 fi
 
 [ -f "$app_src" ] || { echo "missing $app_src" >&2; exit 1; }
-[ -f "$eq_src" ] || { echo "warning: $eq_src not found; the EQ feature will be disabled" >&2; }
 
 # Write access check.
 if [ -z "$DESTDIR" ]; then
@@ -97,11 +97,6 @@ mkdir -p "$root/bin" \
 
 install -m 0755 "$app_src" "$app_dst"
 echo "installed $app_dst"
-
-if [ -f "$eq_src" ]; then
-    install -m 0644 "$eq_src" "$eq_dst"
-    echo "installed $eq_dst"
-fi
 
 [ -f "$here/data/$NAME.desktop" ] && {
     install -m 0644 "$here/data/$NAME.desktop" "$desktop_dst"

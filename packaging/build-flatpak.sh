@@ -31,7 +31,6 @@ rm -rf "$BUILD"
 mkdir -p "$BUILD"
 
 cp "$HERE/../pipewire-audio-gui.py" "$BUILD/"
-cp "$HERE/../pipewire_eq.py" "$BUILD/"
 cp "$HERE/data/pipewire-audio-gui.svg" "$BUILD/pipewire-audio-gui.svg"
 
 # Flatpak desktop entry: command and icon are the app-id.

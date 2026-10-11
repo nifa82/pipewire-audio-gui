@@ -27,12 +27,6 @@ pub enum PwAgError {
     #[error("wireplumber error: {0}")]
     WirePlumber(String),
 
-    #[error("easyeffects error: {0}")]
-    EasyEffects(String),
-
-    #[error("autoeq error: {0}")]
-    AutoEq(String),
-
     #[error("gtk error: {0}")]
     Gtk(String),
 }

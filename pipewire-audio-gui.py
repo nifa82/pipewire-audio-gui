@@ -18,7 +18,7 @@ try:
     import gi
 
     gi.require_version("Gtk", "3.0")
-    from gi.repository import Gtk, GLib
+    from gi.repository import Gtk, Gdk, GLib
 except (ImportError, ValueError, AttributeError) as e:
     sys.stderr.write(
         "GTK3 (PyGObject) not available: %s\n"
@@ -39,6 +39,50 @@ WP_LUA_FILE = os.path.join(WP_LUA_DIR, "51-user-device-format.lua")
 
 APP_DIR = os.path.join(CONFIG_HOME, "pipewire-audio-gui")
 MAPPING_FILE = os.path.join(APP_DIR, "mapping.json")
+
+THEME_SEARCH_DIRS = [
+    os.path.join(CONFIG_HOME, "themes"),
+    os.path.join(os.path.expanduser("~"), ".themes"),
+    "/usr/share/themes",
+    "/usr/local/share/themes",
+]
+
+DESKTOP_THEME_PREFERENCE = {
+    "kde": ["Breeze", "Breeze-Dark"],
+    "plasma": ["Breeze", "Breeze-Dark"],
+    "gnome": ["Yaru", "Adwaita", "Yaru-dark", "Adwaita-dark"],
+    "unity": ["Yaru", "Ambiance"],
+    "xfce": ["Greybird", "Adwaita"],
+    "cinnamon": ["Adwaita"],
+}
+
+DARK_SUFFIXES = ("-dark", "-Dark", "_dark")
+
+_CSS_PROVIDER = None
+
+KDE_COLOR_DIRS = [
+    os.path.join(CONFIG_HOME, "color-schemes"),
+    os.path.expanduser("~/.config/color-schemes"),
+    os.path.expanduser("~/.local/share/color-schemes"),
+    "/usr/local/share/color-schemes",
+    "/usr/share/color-schemes",
+]
+
+KDE_LOOKANDFEEL_DIRS = [
+    os.path.join(CONFIG_HOME, "plasma/look-and-feel"),
+    os.path.expanduser("~/.local/share/plasma/look-and-feel"),
+    os.path.expanduser("~/.plasma/look-and-feel"),
+    "/usr/local/share/plasma/look-and-feel",
+    "/usr/share/plasma/look-and-feel",
+]
+
+KDE_PLASMA_THEME_DIRS = [
+    os.path.join(CONFIG_HOME, "plasma/themes"),
+    os.path.expanduser("~/.local/share/plasma/themes"),
+    os.path.expanduser("~/.plasma/themes"),
+    "/usr/local/share/plasma/themes",
+    "/usr/share/plasma/themes",
+]
 
 RATES = [8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
 AUTO_RATES = [44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
@@ -818,6 +862,586 @@ def restart_services(names):
     return run(cmd)
 
 
+def parse_rgb(value):
+    """Parse a colour from a .colors file: 'r,g,b' or '#rrggbb'."""
+    value = (value or "").strip()
+    if value.startswith("#") and len(value) >= 7:
+        try:
+            return (int(value[1:3], 16), int(value[3:5], 16), int(value[5:7], 16))
+        except ValueError:
+            return None
+    parts = [p for p in value.replace(";", ",").split(",") if p.strip()]
+    if len(parts) < 3:
+        return None
+    try:
+        return tuple(max(0, min(255, int(float(p)))) for p in parts[:3])
+    except ValueError:
+        return None
+
+
+def rgb_to_css(rgb):
+    return "#%02x%02x%02x" % tuple(rgb)
+
+
+def color_is_dark(rgb):
+    """Perceived-brightness test: is this colour a dark background?"""
+    r, g, b = rgb
+    return (0.299 * r + 0.587 * g + 0.114 * b) < 128
+
+
+def parse_kde_color_file(path):
+    """Parse a KDE .colors file into {role: {key: (r,g,b)}}."""
+    roles = {}
+    group = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("["):
+                    group = line[1:-1][7:] if line.startswith("[Colors:") else None
+                    continue
+                if "=" in line and group:
+                    key, value = line.split("=", 1)
+                    rgb = parse_rgb(value)
+                    if rgb:
+                        roles.setdefault(group, {})[key.strip()] = rgb
+    except OSError:
+        return {}
+    return roles
+
+
+def kde_color_scheme_is_dark(path):
+    """Decide a scheme's brightness from its Window background, not its name."""
+    roles = parse_kde_color_file(path)
+    window = roles.get("Window", {})
+    rgb = window.get("BackgroundNormal") or window.get("BackgroundAlternate")
+    if not rgb:
+        view = roles.get("View", {})
+        rgb = view.get("BackgroundNormal")
+    return color_is_dark(rgb) if rgb else False
+
+
+def kde_colors_to_css(roles):
+    """Build GTK CSS that repaints this app using a KDE colour scheme.
+
+    Only this process is affected: nothing is written to kdeglobals and no
+    plasma-apply-* tool is run, so the system desktop is untouched.
+    """
+    win = roles.get("Window", {})
+    view = roles.get("View", {})
+    sel = roles.get("Selection", {})
+    btn = roles.get("Button", {})
+    tip = roles.get("Tooltip", {})
+    wm = roles.get("WM", roles.get("Window", {}))
+
+    def bg(src, default=(255, 255, 255)):
+        return src.get("BackgroundNormal", default)
+
+    def fg(src, default=(0, 0, 0)):
+        return src.get("ForegroundNormal", default)
+
+    window_bg = bg(win, (240, 240, 240))
+    window_fg = fg(win, (20, 20, 20))
+    window_alt = win.get("BackgroundAlternate", window_bg)
+    window_dim = win.get("ForegroundInactive", window_fg)
+    view_bg = bg(view, window_bg)
+    view_fg = fg(view, window_fg)
+    view_alt = view.get("BackgroundAlternate", view_bg)
+    sel_bg = sel.get("BackgroundNormal", (53, 132, 228))
+    sel_fg = sel.get("ForegroundNormal", (255, 255, 255))
+    btn_bg = bg(btn, window_bg)
+    btn_fg = fg(btn, window_fg)
+    tip_bg = bg(tip, (35, 35, 35))
+    tip_fg = fg(tip, (255, 255, 255))
+    accent = (
+        sel.get("DecorationFocus")
+        or win.get("DecorationFocus")
+        or sel_bg
+    )
+    positive = win.get("ForegroundPositive", (40, 160, 60))
+    negative = win.get("ForegroundNegative", (200, 40, 40))
+    title_bg = wm.get("activeBackground", window_bg)
+    title_fg = wm.get("activeForeground", window_fg)
+    title_bg_inactive = wm.get("inactiveBackground", window_bg)
+    title_fg_inactive = wm.get("inactiveForeground", window_dim)
+    border = rgb_to_css(accent)
+
+    return """/* PipeWire Audio Settings - KDE colour scheme, this app only */
+@define-color kde_window_bg %(window_bg)s;
+@define-color kde_window_fg %(window_fg)s;
+@define-color kde_selection %(sel_bg)s;
+@define-color kde_selected_fg %(sel_fg)s;
+@define-color kde_accent %(accent)s;
+
+.background,
+window,
+.dialog,
+.gtkdialog {
+  background-color: %(window_bg)s;
+  color: %(window_fg)s;
+}
+
+label, text, .caption {
+  color: %(window_fg)s;
+}
+
+.dim-label {
+  color: %(window_dim)s;
+}
+
+textview,
+entry,
+spinbutton,
+combobox button.combo,
+.treeview.view,
+list,
+listrow {
+  background-color: %(view_bg)s;
+  color: %(view_fg)s;
+}
+
+treeview.view:selected,
+list:selected,
+listrow:selected,
+entry:selected,
+textview:selected {
+  background-color: %(sel_bg)s;
+  color: %(sel_fg)s;
+}
+
+treeview.view:hover,
+listrow:hover {
+  background-color: %(view_alt)s;
+}
+
+button {
+  background-color: %(btn_bg)s;
+  color: %(btn_fg)s;
+  border-color: %(accent)s;
+}
+
+button:hover {
+  background-color: %(window_alt)s;
+}
+
+button:checked,
+button:checked:hover {
+  background-color: %(sel_bg)s;
+  color: %(sel_fg)s;
+}
+
+checkbutton, radiobutton {
+  color: %(btn_fg)s;
+  background-color: transparent;
+}
+
+checkbutton:checked, radiobutton:checked {
+  color: %(sel_fg)s;
+  background-color: %(sel_bg)s;
+}
+
+scale trough {
+  background-color: %(view_alt)s;
+  border-color: %(border)s;
+}
+
+scale highlight {
+  background-color: %(accent)s;
+}
+
+progressbar trough {
+  background-color: %(view_alt)s;
+  border-color: %(border)s;
+}
+
+progressbar progress {
+  background-color: %(accent)s;
+}
+
+frame, .frame {
+  border-color: %(window_alt)s;
+}
+
+notebook header {
+  background-color: %(window_alt)s;
+  color: %(window_fg)s;
+}
+
+notebook header:checked {
+  background-color: %(window_bg)s;
+  color: %(sel_fg)s;
+}
+
+tooltip {
+  background-color: %(tip_bg)s;
+  color: %(tip_fg)s;
+  border-color: %(tip_fg)s;
+}
+
+menubar, menu, .menu {
+  background-color: %(window_bg)s;
+  color: %(window_fg)s;
+}
+
+menuitem:hover {
+  background-color: %(sel_bg)s;
+  color: %(sel_fg)s;
+}
+
+.titlebar, headerbar {
+  background-color: %(title_bg)s;
+  color: %(title_fg)s;
+}
+
+.titlebar:backdrop, headerbar:backdrop {
+  background-color: %(title_bg_inactive)s;
+  color: %(title_fg_inactive)s;
+}
+""" % {
+        "window_bg": rgb_to_css(window_bg),
+        "window_fg": rgb_to_css(window_fg),
+        "window_dim": rgb_to_css(window_dim),
+        "window_alt": rgb_to_css(window_alt),
+        "view_bg": rgb_to_css(view_bg),
+        "view_fg": rgb_to_css(view_fg),
+        "view_alt": rgb_to_css(view_alt),
+        "sel_bg": rgb_to_css(sel_bg),
+        "sel_fg": rgb_to_css(sel_fg),
+        "btn_bg": rgb_to_css(btn_bg),
+        "btn_fg": rgb_to_css(btn_fg),
+        "accent": rgb_to_css(accent),
+        "tip_bg": rgb_to_css(tip_bg),
+        "tip_fg": rgb_to_css(tip_fg),
+        "title_bg": rgb_to_css(title_bg),
+        "title_fg": rgb_to_css(title_fg),
+        "title_bg_inactive": rgb_to_css(title_bg_inactive),
+        "title_fg_inactive": rgb_to_css(title_fg_inactive),
+        "border": border,
+    }
+
+
+def apply_app_css(css):
+    """Install app-only CSS at APPLICATION priority; clears it when css is None.
+
+    Returns (ok, message).
+    """
+    global _CSS_PROVIDER
+    try:
+        if css is None:
+            # Dropping the reference alone is not enough: the provider stays
+            # registered in the style context, so colours would persist until
+            # the app restarted.
+            if _CSS_PROVIDER is not None:
+                screen = Gdk.Screen.get_default()
+                context = (
+                    Gtk.StyleContext()
+                    if screen is None
+                    else Gtk.StyleContext.get_for_screen(screen)
+                )
+                try:
+                    context.remove_provider(_CSS_PROVIDER)
+                except Exception:
+                    pass
+            _CSS_PROVIDER = None
+            return True, "cleared"
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css.encode("utf-8"))
+        screen = Gdk.Screen.get_default()
+        context = (
+            Gtk.StyleContext()
+            if screen is None
+            else Gtk.StyleContext.get_for_screen(screen)
+        )
+        if _CSS_PROVIDER is not None:
+            context.remove_provider(_CSS_PROVIDER)
+        context.add_provider(provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # Keep a reference: a collected provider stops applying.
+        _CSS_PROVIDER = provider
+        return True, "applied"
+    except Exception as e:
+        return False, str(e)
+
+
+def find_kde_color_file(name):
+    for base in KDE_COLOR_DIRS:
+        for ext in (".colors", ".color"):
+            path = os.path.join(base, name + ext)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def detect_kde():
+    """True when running inside a KDE Plasma session."""
+    # An explicit session name wins: a desktop launched from a KDE terminal
+    # still exports KDE_* variables, so don't let them override a non-KDE desktop.
+    for var in ("XDG_CURRENT_DESKTOP", "DESKTOP_SESSION"):
+        value = (os.environ.get(var) or "").lower()
+        if not value:
+            continue
+        return "kde" in value or "plasma" in value
+    if os.environ.get("KDE_FULL_SESSION") or os.environ.get("KDE_SESSION_VERSION"):
+        return True
+    return False
+
+
+def detect_desktop():
+    """Best-effort desktop environment name: 'kde', 'gnome', 'xfce', ..."""
+    raw = os.environ.get("XDG_CURRENT_DESKTOP", "")
+    if not raw:
+        raw = os.environ.get("DESKTOP_SESSION", "")
+    raw = raw.lower()
+    for key in ("kde", "plasma", "gnome", "unity", "xfce", "cinnamon", "mate", "lxde", "budgie"):
+        if key in raw:
+            return "kde" if key == "plasma" else key
+    return raw or "unknown"
+
+
+def is_gtk3_theme_dir(path):
+    return (
+        os.path.isdir(os.path.join(path, "gtk-3.0"))
+        or os.path.isdir(os.path.join(path, "gtk-2.0"))
+    )
+
+
+def list_gtk_themes():
+    """All installed GTK themes, sorted, user themes shadowing system ones."""
+    found = {}
+    for base in THEME_SEARCH_DIRS:
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for name in entries:
+            path = os.path.join(base, name)
+            if is_gtk3_theme_dir(path):
+                found[name] = path
+    return sorted(found, key=lambda n: n.lower())
+
+
+def theme_looks_dark(name):
+    low = (name or "").lower()
+    return any(low.endswith(suffix.lower()) for suffix in DARK_SUFFIXES)
+
+
+def default_theme_for_desktop(dark=None):
+    """Pick a sensible GTK theme for the running desktop, if installed.
+
+    When `dark` is given, the list is filtered so a light theme is never used
+    for a dark desktop (and vice versa).
+    """
+    installed = list_gtk_themes()
+    if not installed:
+        return None
+    lowered = {name.lower(): name for name in installed}
+    for key in ("kde", "gnome", "unity", "xfce", "cinnamon"):
+        if key != detect_desktop():
+            continue
+        candidates = DESKTOP_THEME_PREFERENCE.get(key, [])
+        if dark is not None:
+            matching = [c for c in candidates if theme_looks_dark(c) == dark]
+            # Fall back to the opposite side only if nothing matches at all.
+            candidates = matching or candidates
+        for candidate in candidates:
+            match = lowered.get(candidate.lower())
+            if match:
+                return match
+    return None
+
+
+def read_ini_config(path):
+    """Parse a simple INI file into {section: {key: value}}."""
+    sections = {}
+    current = sections.setdefault("", {})
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith(("#", ";")):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    current = sections.setdefault(line[1:-1], {})
+                    continue
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    current[key.strip()] = value.strip()
+    except OSError:
+        return {}
+    return sections
+
+
+def kde_config_home():
+    """Locate the real Plasma config directory.
+
+    XDG_CONFIG_HOME is unreliable here: inside a Flatpak or sandbox it points
+    at the container's own config, so kdeglobals would never be found and the
+    app would silently stop following the desktop.
+    """
+    for base in (CONFIG_HOME, os.path.expanduser("~/.config")):
+        if os.path.isfile(os.path.join(base, "kdeglobals")):
+            return base
+    return CONFIG_HOME
+
+
+def read_kde_theme_settings():
+    """The systemwide Plasma theme, as configured in the user's config files.
+
+    Reads kdeglobals and plasmarc without modifying anything - the app only
+    ever follows the desktop, it never changes it.
+    """
+    config_home = kde_config_home()
+    kdeglobals = read_ini_config(os.path.join(config_home, "kdeglobals"))
+    general = kdeglobals.get("General", {})
+    kde = kdeglobals.get("KDE", {})
+    plasmarc = read_ini_config(os.path.join(config_home, "plasmarc"))
+    theme_section = plasmarc.get("Theme", {})
+    return {
+        "color_scheme": general.get("ColorScheme", ""),
+        "widget_style": general.get("widgetStyle", ""),
+        "plasma_theme": theme_section.get("name", "")
+        or kde.get("Theme", ""),
+        "look_and_feel": kde.get("LookAndFeelPackage", ""),
+    }
+
+
+def resolve_gtk_theme(widget_style, dark):
+    """Map a Plasma widget style onto an installed GTK theme."""
+    installed = list_gtk_themes()
+    lowered = {name.lower(): name for name in installed}
+    style = (widget_style or "").strip()
+
+    def pick(candidates):
+        for candidate in candidates:
+            if not candidate:
+                continue
+            match = lowered.get(candidate.lower())
+            if match:
+                return match
+        return None
+
+    if style:
+        # 'Breeze-Dark' -> try it, then the light counterpart and vice versa.
+        variants = [style]
+        if theme_looks_dark(style):
+            variants.append(style.rsplit("-", 1)[0])
+        else:
+            variants.extend(style + suffix for suffix in DARK_SUFFIXES)
+        match = pick(variants)
+        if match:
+            return match
+    desktop_default = default_theme_for_desktop(dark)
+    if desktop_default:
+        match = pick([desktop_default])
+        if match:
+            return match
+    match = pick(["Breeze-Dark", "Adwaita-dark"]) if dark else pick(
+        ["Breeze", "Adwaita"]
+    )
+    if match:
+        return match
+    # Last resort: any installed theme with the right brightness. Better than
+    # forcing a mismatched one; if nothing fits, leave GTK's own default.
+    for name in installed:
+        if theme_looks_dark(name) == dark:
+            return name
+    return None
+
+
+def follow_system_theme():
+    """Match this app to the systemwide desktop theme. Never modifies it.
+
+    Returns (gtk_theme, dark, kde_color_scheme) for logging.
+    """
+    kde = detect_kde()
+    color_scheme = widget_style = ""
+    if kde:
+        settings = read_kde_theme_settings()
+        color_scheme = settings["color_scheme"]
+        widget_style = settings["widget_style"]
+
+    dark = False
+    if color_scheme:
+        path = find_kde_color_file(color_scheme)
+        if path:
+            dark = kde_color_scheme_is_dark(path)
+        else:
+            dark = theme_looks_dark(color_scheme)
+    else:
+        dark = theme_looks_dark(current_gtk_theme())
+
+    theme = resolve_gtk_theme(widget_style, dark)
+
+    settings_obj = gtk_settings()
+    if settings_obj is not None:
+        try:
+            settings_obj.set_property("gtk-application-prefer-dark-theme", dark)
+        except Exception:
+            pass
+        if theme:
+            try:
+                settings_obj.set_property("gtk-theme-name", theme)
+            except Exception:
+                pass
+
+    # Match the Plasma colour scheme as well, so the window follows the
+    # desktop colours without touching the system configuration.
+    if kde and color_scheme:
+        path = find_kde_color_file(color_scheme)
+        if path:
+            roles = parse_kde_color_file(path)
+            if roles:
+                apply_app_css(kde_colors_to_css(roles))
+            else:
+                apply_app_css(None)
+        else:
+            apply_app_css(None)
+    else:
+        apply_app_css(None)
+
+    return theme, dark, color_scheme
+
+
+def system_theme_signature():
+    """Cheap fingerprint of the desktop theme, to detect changes."""
+    settings = read_kde_theme_settings() if detect_kde() else {}
+    return (
+        detect_kde(),
+        settings.get("color_scheme", ""),
+        settings.get("widget_style", ""),
+        settings.get("plasma_theme", ""),
+    )
+
+
+def gtk_settings():
+    try:
+        return Gtk.Settings.get_default()
+    except Exception:
+        return None
+
+
+def current_gtk_theme():
+    settings = gtk_settings()
+    if settings is None:
+        return ""
+    try:
+        return settings.get_property("gtk-theme-name") or ""
+    except Exception:
+        return ""
+
+
+def theme_installed(name):
+    if not name:
+        return False
+    if is_gtk3_theme_dir(os.path.join("/usr/share/themes", name)):
+        return True
+    for base in THEME_SEARCH_DIRS:
+        if is_gtk3_theme_dir(os.path.join(base, name)):
+            return True
+    return False
+
+
 class MainWindow(Gtk.Window):
     def __init__(self):
         Gtk.Window.__init__(self, title="PipeWire Audio Settings")
@@ -1078,7 +1702,7 @@ class MainWindow(Gtk.Window):
         dialog.set_transient_for(self)
         dialog.set_modal(True)
         dialog.set_program_name("PipeWire Audio Settings")
-        dialog.set_version("1.0.0")
+        dialog.set_version("1.1.0")
         dialog.set_copyright("Copyright © 2026 nifa82")
         dialog.set_license_type(Gtk.License.MIT_X11)
         dialog.set_website("https://github.com/nifa82/pipewire-audio-gui")
@@ -1596,10 +2220,40 @@ def main():
             )
         )
         sys.exit(1)
+    theme, dark, colors = follow_system_theme()
     win = MainWindow()
+    win.log(
+        "Following system theme: %s%s."
+        % (
+            theme or "default GTK theme",
+            " (%s colours, %s)" % (colors, "dark" if dark else "light")
+            if colors
+            else "",
+        )
+    )
     win.connect("destroy", lambda w: Gtk.main_quit())
     win.connect("delete-event", win.on_delete_event)
     win.show_all()
+    # Keep following the desktop if the Plasma theme changes while we run.
+    _LAST_THEME_SIGNATURE = [system_theme_signature()]
+
+    def follow_tick():
+        signature = system_theme_signature()
+        if signature != _LAST_THEME_SIGNATURE[0]:
+            _LAST_THEME_SIGNATURE[0] = signature
+            theme, dark, colors = follow_system_theme()
+            win.log(
+                "System theme changed: %s%s."
+                % (
+                    theme or "default GTK theme",
+                    " (%s colours, %s)" % (colors, "dark" if dark else "light")
+                    if colors
+                    else "",
+                )
+            )
+        return True
+
+    GLib.timeout_add_seconds(30, follow_tick)
     Gtk.main()
 
 

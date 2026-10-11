@@ -21,7 +21,6 @@ ROOT="$STAGE/$NAME-$VERSION"
 mkdir -p "$ROOT/data"
 
 cp "$HERE/../pipewire-audio-gui.py" "$ROOT/"
-cp "$HERE/../pipewire_eq.py" "$ROOT/"
 cp "$HERE/../README.md" "$ROOT/"
 cp "$HERE/install.sh" "$ROOT/"
 cp "$HERE/data/$NAME.desktop" "$ROOT/data/"
