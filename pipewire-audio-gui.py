@@ -2778,7 +2778,8 @@ def main():
                 os.environ.get("WAYLAND_DISPLAY") or "(unset)",
             )
         )
-        sys.exit(1)()
+        sys.exit(1)
+    theme, dark, colors = follow_system_theme()
     win = MainWindow()
     win.log(
         "Following system theme: %s%s."
