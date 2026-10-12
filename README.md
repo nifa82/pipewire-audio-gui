@@ -33,11 +33,15 @@ including automatic per-rate bit-perfect/rescaling and background auto-apply.
 - Tray menu: Show/Hide, Auto-apply mappings, Apply mapping now, Quit.
 - Without AppIndicator it falls back to a legacy `Gtk.StatusIcon`.
 
-**Bit Depth**
+**Bit Depth & Buffer Size**
 - Per output device: `Save for Device` writes a WirePlumber rule
   (`audio.format = S16LE / S24LE / S24_32LE / S32LE`) and restarts WirePlumber;
   ALSA uses `monitor.alsa.rules`, Bluetooth `monitor.bluez5.rules`.
 - `Reset Device Format` returns to automatic (bit-perfect) negotiation.
+- **Buffer size (ALSA period size)**: pick `64–2048` frames to trade latency
+  for CPU load; `Save Buffer Size` writes a WirePlumber rule
+  (`api.alsa.period-size`) and restarts WirePlumber.
+- `Reset Buffer Size` returns to the device default.
 
 **Appearance — follows your system theme**
 There is no theme picker: the app simply matches your desktop. It reads the
@@ -137,6 +141,8 @@ whenever the input sample rate changes.
 | Per-rate mapping + autowatch flag | `~/.config/pipewire-audio-gui/mapping.json` |
 | Bit depth rule (WirePlumber >= 0.5, JSON) | `~/.config/wireplumber/wireplumber.conf.d/51-user-device-format.conf` |
 | Bit depth rule (WirePlumber < 0.5, Lua) | `~/.config/wireplumber/main.lua.d/51-user-device-format.lua` |
+| Buffer size rule (WirePlumber >= 0.5, JSON) | `~/.config/wireplumber/wireplumber.conf.d/52-user-buffer-size.conf` |
+| Buffer size rule (WirePlumber < 0.5, Lua) | `~/.config/wireplumber/main.lua.d/52-user-buffer-size.lua` |
 
 `mapping.json` looks like:
 

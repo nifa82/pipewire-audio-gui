@@ -96,6 +96,15 @@ MODES = [
     ("fixed", "Fixed (resample everything to one rate)"),
 ]
 
+BUFFER_SIZES = [
+    ("64", "64 frames (lowest latency, highest CPU)"),
+    ("128", "128 frames (very low latency)"),
+    ("256", "256 frames (low latency)"),
+    ("512", "512 frames (balanced)"),
+    ("1024", "1024 frames (high latency, low CPU)"),
+    ("2048", "2048 frames (highest latency, lowest CPU)"),
+]
+
 FORMATS = [
     ("", "Default (auto-negotiated)"),
     ("S16LE", "S16LE - 16-bit integer (2 bytes/sample)"),
@@ -851,6 +860,50 @@ def remove_format_config():
         if remove_file(path):
             removed.append(path)
     return removed
+
+
+def write_buffer_config(device_name, buffer_size, api="alsa"):
+    """Write a WirePlumber rule setting the ALSA period size for a device."""
+    import json as _json
+    os.makedirs(WP_JSON_DIR, exist_ok=True)
+    os.makedirs(WP_LUA_DIR, exist_ok=True)
+    lua_code = (
+        "local rule = rule.new()\n"
+        "rule:set_match(\"device.api\", \"%s\")\n"
+        "rule:set_match(\"device.name\", \"%s\")\n"
+        "rule:set_properties({\n"
+        "  [\"api.alsa.period-size\"] = %s,\n"
+        "  [\"api.alsa.periods\"] = 3,\n"
+        "})\n"
+        "rule:register()\n" % (api, device_name, buffer_size)
+    )
+    rule_json = {
+        "type": "script",
+        "name": "user-buffer-size",
+        "description": "User-defined ALSA buffer size",
+        "priority": 100,
+        "script": {
+            "type": "lua",
+            "code": lua_code,
+        },
+    }
+    safe_write(WP_JSON_FILE.replace("51-user-device-format", "52-user-buffer-size"),
+               _json.dumps(rule_json, indent=2) + "\n")
+    safe_write(WP_LUA_FILE.replace("51-user-device-format", "52-user-buffer-size"),
+               lua_code + "\n")
+    return restart_services(["wireplumber.service"])
+
+
+def remove_buffer_config():
+    """Remove the user buffer size rule."""
+    import glob as _glob
+    for pat in [
+        WP_JSON_DIR + "/52-user-buffer-size*",
+        WP_LUA_DIR + "/52-user-buffer-size*",
+    ]:
+        for f in _glob.glob(pat):
+            remove_file(f)
+    return restart_services(["wireplumber.service"])
 
 
 def remove_rate_config():
@@ -1628,6 +1681,16 @@ class MainWindow(Gtk.Window):
         fmt_row.pack_start(Gtk.Label(label=""), True, True, 0)
         fmt_grid.pack_start(fmt_row, False, False, 0)
 
+        buf_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        buf_row.pack_start(Gtk.Label(label="Buffer size:", xalign=0), False, False, 0)
+        self.buffer_combo = Gtk.ComboBoxText()
+        for bid, label in BUFFER_SIZES:
+            self.buffer_combo.append(bid, label)
+        self.buffer_combo.set_active(2)  # 256 default
+        buf_row.pack_start(self.buffer_combo, False, False, 0)
+        buf_row.pack_start(Gtk.Label(label=""), True, True, 0)
+        fmt_grid.pack_start(buf_row, False, False, 0)
+
         fmt_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         save_fmt = Gtk.Button(label="Save for Device")
         save_fmt.connect("clicked", lambda w: self.on_save_format())
@@ -1638,11 +1701,22 @@ class MainWindow(Gtk.Window):
         fmt_btns.pack_start(Gtk.Label(label=""), True, True, 0)
         fmt_grid.pack_start(fmt_btns, False, False, 0)
 
+        buf_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        save_buf = Gtk.Button(label="Save Buffer Size")
+        save_buf.connect("clicked", lambda w: self.on_save_buffer())
+        buf_btns.pack_start(save_buf, False, False, 0)
+        reset_buf = Gtk.Button(label="Reset Buffer Size")
+        reset_buf.connect("clicked", lambda w: self.on_reset_buffer())
+        buf_btns.pack_start(reset_buf, False, False, 0)
+        buf_btns.pack_start(Gtk.Label(label=""), True, True, 0)
+        fmt_grid.pack_start(buf_btns, False, False, 0)
+
         fmt_note = Gtk.Label(
             label=(
-                "Note: PipeWire mixes internally in 32-bit float. This setting "
-                "changes the sample format your device receives (written as a "
-                "WirePlumber rule) and applies after WirePlumber restarts."
+                "Note: PipeWire mixes internally in 32-bit float. The format "
+                "changes the sample format your device receives; the buffer size "
+                "sets the ALSA period size (latency vs CPU trade-off). Both are "
+                "written as WirePlumber rules and apply after WirePlumber restarts."
             ),
             xalign=0,
         )
@@ -2195,6 +2269,31 @@ class MainWindow(Gtk.Window):
         else:
             self.log("WirePlumber restart failed: %s" % (err or out))
         GLib.timeout_add(1500, self.refresh)
+
+    def on_save_buffer(self):
+        """Save buffer size for the selected device and restart WirePlumber."""
+        dev = self.get_selected_device()
+        if not dev:
+            self.log("No device selected.")
+            return
+        dev_name = dev.get("name", "")
+        api = dev.get("api", "alsa")
+        buf = self.buffer_combo.get_active_id() or "256"
+        rc, out, err = write_buffer_config(dev_name, buf, api)
+        if rc != 0:
+            self.log("Buffer size save failed: %s" % err)
+        else:
+            self.log("Buffer size %s saved for %s; WirePlumber restarted." % (buf, dev_name))
+        self.refresh_streams()
+
+    def on_reset_buffer(self):
+        """Remove the user buffer size rule and restart WirePlumber."""
+        rc, out, err = remove_buffer_config()
+        if rc != 0:
+            self.log("Buffer size reset failed: %s" % err)
+        else:
+            self.log("Buffer size reset to default; WirePlumber restarted.")
+        self.refresh_streams()
 
     def restart_pipewire(self):
         rc, out, err = restart_services(["pipewire.service", "pipewire-pulse.service"])
