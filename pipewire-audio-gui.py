@@ -590,6 +590,107 @@ def set_device_settings(devices, device_id, settings):
     devices[device_id] = settings
 
 
+# Profiles - saved presets (mapping + autowatch + devices)
+PROFILE_DIR = os.path.join(APP_DIR, "profiles")
+BUILTIN_PROFILES = {
+    "Gaming": {"autowatch": True, "rates": {str(r): "bitperfect" for r in [44100, 48000, 88200, 96000]}, "devices": {}},
+    "Music": {"autowatch": True, "rates": {str(r): "bitperfect" for r in RATES}, "devices": {}},
+    "Recording": {"autowatch": True, "rates": {str(r): "bitperfect" for r in [44100, 48000, 96000, 192000]}, "devices": {}},
+}
+
+
+def ensure_profile_dir():
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+
+
+def list_profiles():
+    """Return list of (name, is_builtin) tuples."""
+    ensure_profile_dir()
+    profiles = [(name, True) for name in BUILTIN_PROFILES]
+    try:
+        for f in os.listdir(PROFILE_DIR):
+            if f.endswith(".json"):
+                name = os.path.splitext(f)[0]
+                if name not in BUILTIN_PROFILES:
+                    profiles.append((name, False))
+    except OSError:
+        pass
+    return profiles
+
+
+def load_profile(name):
+    """Load a profile by name. Returns (mapping, autowatch, devices) or None."""
+    if name in BUILTIN_PROFILES:
+        p = BUILTIN_PROFILES[name]
+        return p.get("rates", default_mapping()["rates"]), p.get("autowatch", True), p.get("devices", {})
+    path = os.path.join(PROFILE_DIR, name + ".json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        return (data.get("rates", default_mapping()["rates"]),
+                data.get("autowatch", True),
+                data.get("devices", {}))
+    except Exception:
+        return None
+
+
+def save_profile(name, mapping, autowatch, devices):
+    """Save a user profile."""
+    ensure_profile_dir()
+    if name in BUILTIN_PROFILES:
+        return False, "Cannot overwrite built-in profile"
+    path = os.path.join(PROFILE_DIR, name + ".json")
+    try:
+        with open(path, "w") as f:
+            json.dump({"rates": mapping, "autowatch": autowatch, "devices": devices}, f, indent=2, sort_keys=True)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def delete_profile(name):
+    """Delete a user profile."""
+    if name in BUILTIN_PROFILES:
+        return False, "Cannot delete built-in profile"
+    path = os.path.join(PROFILE_DIR, name + ".json")
+    try:
+        os.remove(path)
+        return True, ""
+    except OSError as e:
+        return False, str(e)
+
+
+def export_profile(name, dest_path):
+    """Export a profile to a file."""
+    data = load_profile(name)
+    if data is None:
+        return False, "Profile not found"
+    mapping, autowatch, devices = data
+    try:
+        with open(dest_path, "w") as f:
+            json.dump({"name": name, "rates": mapping, "autowatch": autowatch, "devices": devices}, f, indent=2, sort_keys=True)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def import_profile(src_path):
+    """Import a profile from a file."""
+    try:
+        with open(src_path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return False, str(e)
+    if not isinstance(data, dict) or "name" not in data:
+        return False, "Invalid profile file"
+    name = data["name"]
+    if name in BUILTIN_PROFILES:
+        return False, "Cannot overwrite built-in profile"
+    return save_profile(name, data.get("rates", {}), data.get("autowatch", True), data.get("devices", {}))
+
+
 def resolve_target(input_rate, mapping):
     action = mapping.get(str(input_rate), BITPERFECT)
     if action == BITPERFECT:
@@ -1812,6 +1913,43 @@ class MainWindow(Gtk.Window):
         fmt_grid.pack_start(fmt_note, False, False, 0)
 
 
+        # Profile frame
+        self.profile_frame = Gtk.Frame(label="Profile")
+        profile_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        profile_box.set_border_width(8)
+        self.profile_frame.add(profile_box)
+
+        profile_box.pack_start(Gtk.Label(label="Profile:", xalign=0), False, False, 0)
+        self.profile_combo = Gtk.ComboBoxText()
+        self.profile_combo.set_hexpand(True)
+        for name, _ in list_profiles():
+            self.profile_combo.append(name, name)
+        self.profile_combo.set_active(0)
+        self.profile_combo.connect("changed", self.on_profile_changed)
+        profile_box.pack_start(self.profile_combo, True, True, 0)
+
+        apply_profile_btn = Gtk.Button(label="Apply")
+        apply_profile_btn.connect("clicked", self.on_apply_profile)
+        profile_box.pack_start(apply_profile_btn, False, False, 0)
+
+        save_profile_btn = Gtk.Button(label="Save As...")
+        save_profile_btn.connect("clicked", self.on_save_profile)
+        profile_box.pack_start(save_profile_btn, False, False, 0)
+
+        delete_profile_btn = Gtk.Button(label="Delete")
+        delete_profile_btn.connect("clicked", self.on_delete_profile)
+        profile_box.pack_start(delete_profile_btn, False, False, 0)
+
+        import_profile_btn = Gtk.Button(label="Import...")
+        import_profile_btn.connect("clicked", self.on_import_profile)
+        profile_box.pack_start(import_profile_btn, False, False, 0)
+
+        export_profile_btn = Gtk.Button(label="Export...")
+        export_profile_btn.connect("clicked", self.on_export_profile)
+        profile_box.pack_start(export_profile_btn, False, False, 0)
+
+        page_rate.pack_start(self.profile_frame, False, False, 0)
+
         log_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         log_page.set_border_width(8)
 
@@ -1857,11 +1995,20 @@ class MainWindow(Gtk.Window):
 
         outer.pack_start(footer, False, False, 0)
 
-    def log(self, text):
+    def log(self, text, level="info"):
         try:
             stamp = datetime.now().strftime("%H:%M:%S")
             end_iter = self.log_buffer.get_end_iter()
-            self.log_buffer.insert(end_iter, "[%s] %s\n" % (stamp, text))
+            # Color tags for themeable log
+            if not hasattr(self, "_log_tags_setup"):
+                self._log_tags_setup = True
+                self.log_buffer.create_tag("log_error", foreground="red", weight=700)
+                self.log_buffer.create_tag("log_warn", foreground="orange", weight=600)
+                self.log_buffer.create_tag("log_info", foreground="white")
+                self.log_buffer.create_tag("log_debug", foreground="lightblue")
+            tag = "log_" + level
+            self.log_buffer.insert(end_iter, "[%s] " % stamp, "log_info")
+            self.log_buffer.insert(end_iter, text + "\n", tag)
             self.log_view.scroll_to_iter(end_iter, 0.0, 0.0, 1.0)
         except Exception:
             pass
@@ -1871,7 +2018,7 @@ class MainWindow(Gtk.Window):
         dialog.set_transient_for(self)
         dialog.set_modal(True)
         dialog.set_program_name("PipeWire Audio Settings")
-        dialog.set_version("1.2.1")
+        dialog.set_version("1.3.0")
         dialog.set_copyright("Copyright © 2026 nifa82")
         dialog.set_license_type(Gtk.License.MIT_X11)
         dialog.set_website("https://github.com/nifa82/pipewire-audio-gui")
@@ -1948,6 +2095,152 @@ class MainWindow(Gtk.Window):
                     note = "  |  device does not support these rates -> resampled"
             lines.append("  %s  [%s]%s" % (s["desc"], rates, note))
         self.streams_label.set_text("\n".join(lines))
+
+    def update_device_caps(self):
+        dev = self.selected_device()
+        if not dev:
+            self.dev_caps_rates.set_text("Supported rates: (select a device)")
+            self.dev_caps_formats.set_text("Supported formats: (select a device)")
+            return
+        rates = dev.get("rates") or []
+        formats = dev.get("formats") or []
+        if rates:
+            self.dev_caps_rates.set_text("Supported rates: %s" % ", ".join("%d Hz" % r for r in rates))
+        else:
+            self.dev_caps_rates.set_text("Supported rates: (unknown)")
+        if formats:
+            self.dev_caps_formats.set_text("Supported formats: %s" % ", ".join(formats))
+        else:
+            self.dev_caps_formats.set_text("Supported formats: (unknown)")
+
+    def on_profile_changed(self, combo):
+        name = combo.get_active_id()
+        if not name:
+            return
+        data = load_profile(name)
+        if data is None:
+            return
+        mapping, autowatch, devices = data
+        self.mapping = mapping
+        self.autowatch = autowatch
+        self.devices_saved = devices
+        self.watch_check.set_active(autowatch)
+        self.refresh_mapping_rows()
+        self.log("Profile loaded: %s" % name)
+
+    def on_apply_profile(self, btn):
+        name = self.profile_combo.get_active_id()
+        if not name:
+            return
+        data = load_profile(name)
+        if data is None:
+            return
+        mapping, autowatch, devices = data
+        self.mapping = mapping
+        self.autowatch = autowatch
+        self.devices_saved = devices
+        self.watch_check.set_active(autowatch)
+        self.refresh_mapping_rows()
+        ok, path, err = save_mapping(mapping, autowatch, devices)
+        if ok:
+            rate = active_input_rate()
+            if rate:
+                apply_mapping_runtime(rate, mapping)
+            self.log("Profile applied: %s" % name)
+        else:
+            self.log("Failed to save profile: %s" % err)
+
+    def on_save_profile(self, btn):
+        dialog = Gtk.Dialog(title="Save Profile", transient_for=self, modal=True,
+                           buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                                    Gtk.STOCK_OK, Gtk.ResponseType.OK))
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("Profile name")
+        dialog.get_content_area().pack_start(Gtk.Label(label="Profile name:"), False, False, 0)
+        dialog.get_content_area().pack_start(entry, False, False, 0)
+        dialog.show_all()
+        if dialog.run() == Gtk.ResponseType.OK:
+            name = entry.get_text().strip()
+            if name:
+                ok, err = save_profile(name, self.mapping, self.autowatch, self.devices_saved)
+                if ok:
+                    self.log("Profile saved: %s" % name)
+                    self.profile_combo.remove_all()
+                    for n, _ in list_profiles():
+                        self.profile_combo.append(n, n)
+                    self.profile_combo.set_active_id(name)
+                else:
+                    self.log("Failed to save profile: %s" % err)
+        dialog.destroy()
+
+    def on_delete_profile(self, btn):
+        name = self.profile_combo.get_active_id()
+        if not name:
+            return
+        if name in BUILTIN_PROFILES:
+            self.log("Cannot delete built-in profile: %s" % name)
+            return
+        dialog = Gtk.MessageDialog(
+            transient_for=self, modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Delete profile '%s'?" % name)
+        if dialog.run() == Gtk.ResponseType.OK:
+            ok, err = delete_profile(name)
+            if ok:
+                self.log("Profile deleted: %s" % name)
+                self.profile_combo.remove_all()
+                for n, _ in list_profiles():
+                    self.profile_combo.append(n, n)
+                self.profile_combo.set_active(0)
+            else:
+                self.log("Failed to delete profile: %s" % err)
+        dialog.destroy()
+
+    def on_import_profile(self, btn):
+        dialog = Gtk.FileChooserDialog(
+            title="Import Profile", transient_for=self,
+            action=Gtk.FileChooserAction.OPEN,
+            buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                     Gtk.STOCK_OPEN, Gtk.ResponseType.OK))
+        filter_json = Gtk.FileFilter()
+        filter_json.set_name("JSON files")
+        filter_json.add_pattern("*.json")
+        dialog.add_filter(filter_json)
+        if dialog.run() == Gtk.ResponseType.OK:
+            path = dialog.get_filename()
+            ok, err = import_profile(path)
+            if ok:
+                self.log("Profile imported")
+                self.profile_combo.remove_all()
+                for n, _ in list_profiles():
+                    self.profile_combo.append(n, n)
+            else:
+                self.log("Failed to import: %s" % err)
+        dialog.destroy()
+
+    def on_export_profile(self, btn):
+        name = self.profile_combo.get_active_id()
+        if not name:
+            return
+        dialog = Gtk.FileChooserDialog(
+            title="Export Profile", transient_for=self,
+            action=Gtk.FileChooserAction.SAVE,
+            buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                     Gtk.STOCK_SAVE, Gtk.ResponseType.OK))
+        dialog.set_current_name(name + ".json")
+        filter_json = Gtk.FileFilter()
+        filter_json.set_name("JSON files")
+        filter_json.add_pattern("*.json")
+        dialog.add_filter(filter_json)
+        if dialog.run() == Gtk.ResponseType.OK:
+            path = dialog.get_filename()
+            ok, err = export_profile(name, path)
+            if ok:
+                self.log("Profile exported to %s" % path)
+            else:
+                self.log("Failed to export: %s" % err)
+        dialog.destroy()
 
     def update_device_caps(self):
         dev = self.selected_device()
@@ -2439,6 +2732,41 @@ class MainWindow(Gtk.Window):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="PipeWire Audio Settings")
+    parser.add_argument("--apply-profile", metavar="NAME", help="Apply a profile and exit (no GUI")
+    parser.add_argument("--list-profiles", action="store_true", help="List available profiles and exit")
+    parser.add_argument("--export-profile", metavar="NAME", help="Export profile to stdout")
+    args = parser.parse_args()
+
+    if args.list_profiles:
+        for name, builtin in list_profiles():
+            print("%s%s" % (name, " (built-in)" if builtin else ""))
+        return
+
+    if args.apply_profile:
+        data = load_profile(args.apply_profile)
+        if data is None:
+            sys.stderr.write("Profile not found: %s\n" % args.apply_profile)
+            sys.exit(1)
+        mapping, autowatch, devices = data
+        save_mapping(mapping, autowatch, devices)
+        rate = active_input_rate()
+        if rate:
+            apply_mapping_runtime(rate, mapping)
+        print("Applied profile: %s" % args.apply_profile)
+        return
+
+    if args.export_profile:
+        data = load_profile(args.export_profile)
+        if data is None:
+            sys.stderr.write("Profile not found: %s\n" % args.export_profile)
+        sys.exit(1)
+        mapping, autowatch, devices = data
+        out = json.dumps({"name": args.export_profile, "rates": mapping, "autowatch": autowatch, "devices": devices}, indent=2, sort_keys=True)
+        sys.stdout.write(out + "\n")
+        return
+
     if not Gtk.init_check():
         sys.stderr.write(
             "Could not initialize GTK: no usable graphical display.\n"
@@ -2450,8 +2778,7 @@ def main():
                 os.environ.get("WAYLAND_DISPLAY") or "(unset)",
             )
         )
-        sys.exit(1)
-    theme, dark, colors = follow_system_theme()
+        sys.exit(1)()
     win = MainWindow()
     win.log(
         "Following system theme: %s%s."
