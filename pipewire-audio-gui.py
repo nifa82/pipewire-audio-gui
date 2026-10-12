@@ -585,10 +585,6 @@ def get_device_settings(devices, device_id):
     return devices.get(device_id, {})
 
 
-def set_device_settings(devices, device_id, settings):
-    """Save settings for a device_id."""
-    devices[device_id] = settings
-
 
 # Profiles - saved presets (mapping + autowatch + devices)
 PROFILE_DIR = os.path.join(APP_DIR, "profiles")
@@ -1034,28 +1030,6 @@ def restart_services(names):
     return run(cmd)
 
 
-def check_services():
-    """Quick check that pipewire and wireplumber are running."""
-    rc1, out1, err1 = run(["systemctl", "--user", "is-active", "pipewire.service"])
-    rc2, out2, err2 = run(["systemctl", "--user", "is-active", "wireplumber.service"])
-    return rc1 == 0, rc2 == 0
-
-
-def get_service_status():
-    """Return (pipewire_ok, wireplumber_ok, pipewire_pid, wireplumber_pid)."""
-    pw_ok, wp_ok = check_services()
-    pw_pid = wp_pid = None
-    try:
-        pw_pid = int(subprocess.check_output(["systemctl", "--user", "show", "--property=MainPID", "pipewire.service"], text=True).split("=")[1].strip())
-        if pw_pid == 0: pw_pid = None
-    except Exception:
-        pass
-    try:
-        wp_pid = int(subprocess.check_output(["systemctl", "--user", "show", "--property=MainPID", "wireplumber.service"], text=True).split("=")[1].strip())
-        if wp_pid == 0: wp_pid = None
-    except Exception:
-        pass
-    return pw_ok, wp_ok, pw_pid, wp_pid
 
 
 def is_autostart_enabled():
@@ -1671,16 +1645,6 @@ def current_gtk_theme():
     except Exception:
         return ""
 
-
-def theme_installed(name):
-    if not name:
-        return False
-    if is_gtk3_theme_dir(os.path.join("/usr/share/themes", name)):
-        return True
-    for base in THEME_SEARCH_DIRS:
-        if is_gtk3_theme_dir(os.path.join(base, name)):
-            return True
-    return False
 
 
 class MainWindow(Gtk.Window):
