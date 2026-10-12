@@ -16,7 +16,7 @@
 
 
 Name:           pipewire-audio-gui
-Version:        1.1.0
+Version:        1.1.1
 Release:        0
 Summary:        Change PipeWire sample rate and bit depth
 

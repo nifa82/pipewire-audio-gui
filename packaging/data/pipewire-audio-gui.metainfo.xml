@@ -27,7 +27,7 @@
     <binary>pipewire-audio-gui</binary>
   </provides>
   <releases>
-    <release version="1.1.0" date="2026-10-11">
+    <release version="1.1.1" date="2026-10-12">
       <description>
         <p>Initial release.</p>
       </description>

@@ -1776,7 +1776,7 @@ class MainWindow(Gtk.Window):
         dialog.set_transient_for(self)
         dialog.set_modal(True)
         dialog.set_program_name("PipeWire Audio Settings")
-        dialog.set_version("1.1.0")
+        dialog.set_version("1.1.1")
         dialog.set_copyright("Copyright © 2026 nifa82")
         dialog.set_license_type(Gtk.License.MIT_X11)
         dialog.set_website("https://github.com/nifa82/pipewire-audio-gui")
