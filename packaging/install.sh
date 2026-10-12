@@ -12,7 +12,7 @@
 set -eu
 
 NAME=pipewire-audio-gui
-VERSION=1.1.1
+VERSION=1.2.0
 
 PREFIX=/usr/local
 DESTDIR=

@@ -541,35 +541,53 @@ def next_preset(value, direction):
 
 
 def default_mapping():
-    return {str(r): BITPERFECT for r in RATES}
+    return {"rates": {str(r): BITPERFECT for r in RATES}, "devices": {}}
 
 
 def load_mapping():
     mapping = default_mapping()
     autowatch = False
+    devices = {}
     try:
         with open(MAPPING_FILE) as f:
             data = json.load(f)
     except Exception:
-        return mapping, autowatch
-    stored = data.get("rates") if isinstance(data, dict) else None
-    if isinstance(stored, dict):
-        for k, v in stored.items():
-            if v == BITPERFECT:
-                mapping[str(k)] = BITPERFECT
-            else:
-                try:
-                    int(v)
-                except (TypeError, ValueError):
-                    continue
-                mapping[str(k)] = int(v)
-    autowatch = bool(data.get("autowatch")) if isinstance(data, dict) else False
-    return mapping, autowatch
+        return mapping, autowatch, devices
+    if isinstance(data, dict):
+        stored = data.get("rates")
+        if isinstance(stored, dict):
+            for k, v in stored.items():
+                if v == BITPERFECT:
+                    mapping[str(k)] = BITPERFECT
+                else:
+                    try:
+                        int(v)
+                    except (TypeError, ValueError):
+                        continue
+                    mapping[str(k)] = int(v)
+        autowatch = bool(data.get("autowatch"))
+        devices = data.get("devices", {})
+    return mapping, autowatch, devices
 
 
-def save_mapping(mapping, autowatch):
-    content = json.dumps({"rates": mapping, "autowatch": bool(autowatch)}, indent=2, sort_keys=True)
-    return safe_write(MAPPING_FILE, content + "\n")
+def save_mapping(mapping, autowatch, devices=None):
+    if devices is None:
+        devices = {}
+    content = json.dumps(
+        {"rates": mapping, "autowatch": bool(autowatch), "devices": devices},
+        indent=2, sort_keys=True
+    )
+    return safe_write(MAPPING_FILE, content + "\\n")
+
+
+def get_device_settings(devices, device_id):
+    """Return saved settings for a device_id, or empty dict."""
+    return devices.get(device_id, {})
+
+
+def set_device_settings(devices, device_id, settings):
+    """Save settings for a device_id."""
+    devices[device_id] = settings
 
 
 def resolve_target(input_rate, mapping):
@@ -913,6 +931,75 @@ def remove_rate_config():
 def restart_services(names):
     cmd = ["systemctl", "--user", "restart"] + names
     return run(cmd)
+
+
+def check_services():
+    """Quick check that pipewire and wireplumber are running."""
+    rc1, out1, err1 = run(["systemctl", "--user", "is-active", "pipewire.service"])
+    rc2, out2, err2 = run(["systemctl", "--user", "is-active", "wireplumber.service"])
+    return rc1 == 0, rc2 == 0
+
+
+def get_service_status():
+    """Return (pipewire_ok, wireplumber_ok, pipewire_pid, wireplumber_pid)."""
+    pw_ok, wp_ok = check_services()
+    pw_pid = wp_pid = None
+    try:
+        pw_pid = int(subprocess.check_output(["systemctl", "--user", "show", "--property=MainPID", "pipewire.service"], text=True).split("=")[1].strip())
+        if pw_pid == 0: pw_pid = None
+    except Exception:
+        pass
+    try:
+        wp_pid = int(subprocess.check_output(["systemctl", "--user", "show", "--property=MainPID", "wireplumber.service"], text=True).split("=")[1].strip())
+        if wp_pid == 0: wp_pid = None
+    except Exception:
+        pass
+    return pw_ok, wp_ok, pw_pid, wp_pid
+
+
+def is_autostart_enabled():
+    """Check if autostart .desktop exists."""
+    desktop = os.path.join(os.path.expanduser("~/.config/autostart"), "pipewire-audio-gui.desktop")
+    return os.path.isfile(desktop)
+
+
+def set_autostart(enabled):
+    """Enable or disable autostart via .desktop in ~/.config/autostart."""
+    autostart_dir = os.path.join(os.path.expanduser("~/.config/autostart"))
+    desktop_path = os.path.join(autostart_dir, "pipewire-audio-gui.desktop")
+    try:
+        if enabled:
+            os.makedirs(autostart_dir, exist_ok=True)
+            exe = shutil.which("pipewire-audio-gui") or os.path.join(os.path.expanduser("~/.local/bin"), "pipewire-audio-gui")
+            content = (
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                "Name=PipeWire Audio Settings\n"
+                "Exec={exe}\n"
+                "Terminal=false\n"
+                "X-GNOME-Autostart-enabled=true\n"
+            ).format(exe=exe)
+            with open(desktop_path, "w") as f:
+                f.write(content)
+        else:
+            if os.path.exists(desktop_path):
+                os.remove(desktop_path)
+        return True
+    except Exception as e:
+        print("Autostart error:", e)
+        return False
+
+
+def notify_send(summary, body, urgency="normal"):
+    """Send a desktop notification if notify-send is available."""
+    path = shutil.which("notify-send")
+    if not path:
+        return False
+    try:
+        subprocess.run([path, "-u", urgency, summary, body], timeout=5)
+        return True
+    except Exception:
+        return False
 
 
 def parse_rgb(value):
@@ -1512,6 +1599,7 @@ class MainWindow(Gtk.Window):
         self.watch_check = None
         self.watch_check_item = None
         self.device_combo = None
+        self._applied_devices = set()
         self.mode_combo = None
         self.rate_combo = None
         self.rate_spin = None
@@ -1776,7 +1864,7 @@ class MainWindow(Gtk.Window):
         dialog.set_transient_for(self)
         dialog.set_modal(True)
         dialog.set_program_name("PipeWire Audio Settings")
-        dialog.set_version("1.1.1")
+        dialog.set_version("1.2.0")
         dialog.set_copyright("Copyright © 2026 nifa82")
         dialog.set_license_type(Gtk.License.MIT_X11)
         dialog.set_website("https://github.com/nifa82/pipewire-audio-gui")
@@ -2029,12 +2117,28 @@ class MainWindow(Gtk.Window):
             if current != rate:
                 set_default_rate(rate)
                 force_rate(None)
-                self.log("Auto: input %dHz -> bit-perfect." % rate)
+                msg = "Auto: input %dHz -> bit-perfect." % rate
+                self.log(msg)
+                notify_send("PipeWire Audio", msg, "low")
         else:
             if current != target:
                 set_default_rate(target)
                 force_rate(target)
-                self.log("Auto: input %dHz -> rescaled to %dHz." % (rate, target))
+                msg = "Auto: input %dHz -> rescaled to %dHz." % (rate, target)
+                self.log(msg)
+                notify_send("PipeWire Audio", msg, "low")
+
+        # Apply saved settings for newly connected devices
+        mapping, autowatch, devices = load_mapping()
+        for dev in self.devices:
+            dev_id = dev.get("device_id")
+            if not dev_id:
+                continue
+            saved = get_device_settings(devices, dev_id)
+            if saved and dev_id not in self._applied_devices:
+                self._apply_device_settings(dev, saved)
+                self._applied_devices.add(dev_id)
+
         return True
 
     def setup_tray(self):

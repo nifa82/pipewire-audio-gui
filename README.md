@@ -43,6 +43,18 @@ including automatic per-rate bit-perfect/rescaling and background auto-apply.
   (`api.alsa.period-size`) and restarts WirePlumber.
 - `Reset Buffer Size` returns to the device default.
 
+**Background auto-apply & notifications**
+- System tray icon keeps the app running; enable *Watch in background and apply automatically* to react to input rate changes.
+- Desktop notifications (`notify-send`) when auto-apply triggers.
+- Per-device saved settings (format + buffer size) are automatically re-applied when a USB DAC or other portable device is reconnected.
+
+**Service status & autostart**
+- Live PipeWire / WirePlumber status indicators in the window footer.
+- *Start on login* checkbox creates a standard autostart `.desktop` entry.
+
+**Device capability panel**
+- The device dropdown shows each output's supported sample rates and formats (queried from PipeWire).
+
 **Appearance — follows your system theme**
 There is no theme picker: the app simply matches your desktop. It reads the
 systemwide Plasma configuration (`kdeglobals` and `plasmarc`, read-only) and
@@ -143,6 +155,8 @@ whenever the input sample rate changes.
 | Bit depth rule (WirePlumber < 0.5, Lua) | `~/.config/wireplumber/main.lua.d/51-user-device-format.lua` |
 | Buffer size rule (WirePlumber >= 0.5, JSON) | `~/.config/wireplumber/wireplumber.conf.d/52-user-buffer-size.conf` |
 | Buffer size rule (WirePlumber < 0.5, Lua) | `~/.config/wireplumber/main.lua.d/52-user-buffer-size.lua` |
+| Per-device settings (format + buffer) | `~/.config/pipewire-audio-gui/mapping.json` (`devices` section) |
+| Autostart entry | `~/.config/autostart/pipewire-audio-gui.desktop` |
 
 `mapping.json` looks like:
 
