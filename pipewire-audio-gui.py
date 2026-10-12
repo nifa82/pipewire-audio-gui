@@ -1612,7 +1612,7 @@ class MainWindow(Gtk.Window):
         self.log_view = None
         self.loading_mapping = False
 
-        self.mapping, self.autowatch = load_mapping()
+        self.mapping, self.autowatch, self.devices_saved = load_mapping()
 
         self.build_ui()
         self.build_mapping_rows()
@@ -1848,6 +1848,13 @@ class MainWindow(Gtk.Window):
         quit_btn = Gtk.Button(label="Quit")
         quit_btn.connect("clicked", lambda w: Gtk.main_quit())
         footer.pack_start(quit_btn, False, False, 0)
+
+        # Autostart checkbox
+        self.autostart_check = Gtk.CheckButton(label="Start on login")
+        self.autostart_check.set_active(is_autostart_enabled())
+        self.autostart_check.connect("toggled", self.on_autostart_toggled)
+        footer.pack_start(self.autostart_check, False, False, 0)
+
         outer.pack_start(footer, False, False, 0)
 
     def log(self, text):
@@ -1941,6 +1948,23 @@ class MainWindow(Gtk.Window):
                     note = "  |  device does not support these rates -> resampled"
             lines.append("  %s  [%s]%s" % (s["desc"], rates, note))
         self.streams_label.set_text("\n".join(lines))
+
+    def update_device_caps(self):
+        dev = self.selected_device()
+        if not dev:
+            self.dev_caps_rates.set_text("Supported rates: (select a device)")
+            self.dev_caps_formats.set_text("Supported formats: (select a device)")
+            return
+        rates = dev.get("rates") or []
+        formats = dev.get("formats") or []
+        if rates:
+            self.dev_caps_rates.set_text("Supported rates: %s" % ", ".join("%d Hz" % r for r in rates))
+        else:
+            self.dev_caps_rates.set_text("Supported rates: (unknown)")
+        if formats:
+            self.dev_caps_formats.set_text("Supported formats: %s" % ", ".join(formats))
+        else:
+            self.dev_caps_formats.set_text("Supported formats: (unknown)")
 
     def update_global_label(self):
         status, err = load_clock_status()
@@ -2217,6 +2241,10 @@ class MainWindow(Gtk.Window):
         elif self.watch_check is not None and self.watch_check.get_active() == val:
             self.autowatch = val
             self.save_mapping_quiet()
+
+    def on_autostart_toggled(self, btn):
+        set_autostart(btn.get_active())
+        self.log("Autostart %s." % ("enabled" if btn.get_active() else "disabled"))
 
     def toggle_window(self):
         if self.get_visible():
