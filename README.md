@@ -48,8 +48,7 @@ including automatic per-rate bit-perfect/rescaling and background auto-apply.
 - Desktop notifications (`notify-send`) when auto-apply triggers.
 - Per-device saved settings (format + buffer size) are automatically re-applied when a USB DAC or other portable device is reconnected.
 
-**Service status & autostart**
-- Live PipeWire / WirePlumber status indicators in the window footer.
+**Autostart**
 - *Start on login* checkbox creates a standard autostart `.desktop` entry.
 
 **Device capability panel**
@@ -111,8 +110,8 @@ python3 pipewire-audio-gui.py
 # build tarball
 ./packaging/make-tarball.sh
 # extract & install
-tar -xzf packaging/dist/pipewire-audio-gui-1.0.0.tar.gz -C /tmp
-/tmp/pipewire-audio-gui-1.0.0/install.sh --user
+tar -xzf packaging/dist/pipewire-audio-gui-1.2.1.tar.gz -C /tmp
+/tmp/pipewire-audio-gui-1.2.1/install.sh --user
 # run
 pipewire-audio-gui
 ```
