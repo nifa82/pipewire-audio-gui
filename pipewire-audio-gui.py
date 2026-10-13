@@ -475,6 +475,9 @@ def load_devices():
             {
                 "id": obj.get("id"),
                 "name": name,
+                # node.name is stable across reconnects (unlike the numeric
+                # PipeWire object id), so it keys per-device saved settings.
+                "device_id": name,
                 "desc": desc,
                 "card": card if isinstance(card, str) else "",
                 "api": api if isinstance(api, str) else "",
@@ -541,7 +544,8 @@ def next_preset(value, direction):
 
 
 def default_mapping():
-    return {"rates": {str(r): BITPERFECT for r in RATES}, "devices": {}}
+    # Flat {rate: action}; device settings travel separately, not nested here.
+    return {str(r): BITPERFECT for r in RATES}
 
 
 def load_mapping():
@@ -567,6 +571,8 @@ def load_mapping():
                     mapping[str(k)] = int(v)
         autowatch = bool(data.get("autowatch"))
         devices = data.get("devices", {})
+        if not isinstance(devices, dict):
+            devices = {}
     return mapping, autowatch, devices
 
 
@@ -1864,7 +1870,10 @@ class MainWindow(Gtk.Window):
         dialog.destroy()
 
     def save_mapping_quiet(self):
-        ok, path, err = save_mapping(self.mapping, self.autowatch)
+        # Keep per-device settings: a quiet save must not wipe them.
+        ok, path, err = save_mapping(
+            self.mapping, self.autowatch, getattr(self, "devices_saved", {})
+        )
         if not ok:
             self.log("Could not save mapping to %s: %s" % (path, err))
         return ok
@@ -2116,6 +2125,20 @@ class MainWindow(Gtk.Window):
             self.watcher_tick()
 
     def watcher_tick(self):
+        # Newly (re)connected devices get their stored format/buffer rules
+        # back, independent of the rate-watching switch.
+        _, _, devices = load_mapping()
+        for dev in self.devices:
+            dev_id = dev.get("device_id")
+            if not dev_id:
+                continue
+            saved = get_device_settings(devices, dev_id)
+            if not isinstance(saved, dict) or not saved:
+                continue
+            if dev_id not in self._applied_devices:
+                self._apply_device_settings(dev, saved)
+                self._applied_devices.add(dev_id)
+
         if not self.autowatch:
             return True
         rate = active_input_rate()
@@ -2142,18 +2165,54 @@ class MainWindow(Gtk.Window):
                 self.log(msg)
                 notify_send("PipeWire Audio", msg, "low")
 
-        # Apply saved settings for newly connected devices
-        mapping, autowatch, devices = load_mapping()
-        for dev in self.devices:
-            dev_id = dev.get("device_id")
-            if not dev_id:
-                continue
-            saved = get_device_settings(devices, dev_id)
-            if saved and dev_id not in self._applied_devices:
-                self._apply_device_settings(dev, saved)
-                self._applied_devices.add(dev_id)
+    def _apply_device_settings(self, dev, saved):
+        """Re-apply stored format/buffer rules for a (re)connected device."""
+        name = dev.get("name", "")
+        api = dev.get("api", "alsa") or "alsa"
+        if "format" in saved:
+            rc, _, err = write_format_config(name, saved["format"], api)
+            self.log(
+                "Re-applied saved format %s for %s." % (saved["format"], name)
+                if rc == 0
+                else "Could not re-apply format for %s: %s" % (name, err)
+            )
+        if "buffer_size" in saved:
+            rc, _, err = write_buffer_config(name, saved["buffer_size"], api)
+            self.log(
+                "Re-applied saved buffer size %s for %s." % (saved["buffer_size"], name)
+                if rc == 0
+                else "Could not re-apply buffer size for %s: %s" % (name, err)
+            )
 
-        return True
+    def _remember_device(self, dev, key, value):
+        """Persist one per-device setting so reconnects re-apply it."""
+        dev_id = (dev.get("device_id") or dev.get("name") or "").strip()
+        if not dev_id:
+            return
+        if not isinstance(self.devices_saved, dict):
+            self.devices_saved = {}
+        entry = self.devices_saved.get(dev_id)
+        if not isinstance(entry, dict):
+            entry = {}
+        entry[key] = value
+        self.devices_saved[dev_id] = entry
+        self.save_mapping_quiet()
+
+    def _forget_device_key(self, key):
+        """Drop one setting kind from all stored devices (used by Reset)."""
+        if not isinstance(self.devices_saved, dict):
+            return
+        changed = False
+        for entry in self.devices_saved.values():
+            if isinstance(entry, dict) and key in entry:
+                del entry[key]
+                changed = True
+        # Prune emptied entries so the file does not accumulate husks.
+        for dev_id in [k for k, v in self.devices_saved.items() if v == {}]:
+            del self.devices_saved[dev_id]
+            changed = True
+        if changed:
+            self.save_mapping_quiet()
 
     def setup_tray(self):
         try:
@@ -2372,6 +2431,7 @@ class MainWindow(Gtk.Window):
             self.log("Could not write %s: %s" % (path, werr))
             return
         self.log("Wrote %s (device=%s, format=%s)." % (path, dev["name"], fmt))
+        self._remember_device(dev, "format", fmt)
         rc, out, err = restart_services(["wireplumber.service"])
         if rc == 0:
             self.log("WirePlumber restarted; format should now be %s for %s." % (fmt, dev["desc"]))
@@ -2380,6 +2440,7 @@ class MainWindow(Gtk.Window):
         GLib.timeout_add(1500, self.refresh)
 
     def on_reset_format(self):
+        self._forget_device_key("format")
         removed = remove_format_config()
         if removed:
             self.log("Removed %s." % ", ".join(removed))
@@ -2394,7 +2455,7 @@ class MainWindow(Gtk.Window):
 
     def on_save_buffer(self):
         """Save buffer size for the selected device and restart WirePlumber."""
-        dev = self.get_selected_device()
+        dev = self.selected_device()
         if not dev:
             self.log("No device selected.")
             return
@@ -2406,10 +2467,12 @@ class MainWindow(Gtk.Window):
             self.log("Buffer size save failed: %s" % err)
         else:
             self.log("Buffer size %s saved for %s; WirePlumber restarted." % (buf, dev_name))
+            self._remember_device(dev, "buffer_size", buf)
         self.refresh_streams()
 
     def on_reset_buffer(self):
         """Remove the user buffer size rule and restart WirePlumber."""
+        self._forget_device_key("buffer_size")
         rc, out, err = remove_buffer_config()
         if rc != 0:
             self.log("Buffer size reset failed: %s" % err)
