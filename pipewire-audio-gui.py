@@ -79,6 +79,8 @@ RATES = [8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 1
 _WATCH_STABLE_TICKS = 2
 AUTO_RATES = [44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
 
+APP_VERSION = "1.3.1"
+
 BITPERFECT = "bitperfect"
 ACTION_BITPERFECT = "bp"
 ACTION_RESCALE = "rs"
@@ -1872,7 +1874,7 @@ class MainWindow(Gtk.Window):
         dialog.set_transient_for(self)
         dialog.set_modal(True)
         dialog.set_program_name("PipeWire Audio Settings")
-        dialog.set_version("1.3.1")
+        dialog.set_version(APP_VERSION)
         dialog.set_copyright("Copyright © 2026 nifa82")
         dialog.set_license_type(Gtk.License.MIT_X11)
         dialog.set_website("https://github.com/nifa82/pipewire-audio-gui")
@@ -2651,6 +2653,7 @@ def main():
         sys.exit(1)
     theme, dark, colors = follow_system_theme()
     win = MainWindow()
+    win.log("PipeWire Audio Settings %s started." % APP_VERSION)
     win.log(
         "Following system theme: %s%s."
         % (
