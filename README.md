@@ -55,6 +55,14 @@ including automatic per-rate bit-perfect/rescaling and background auto-apply.
 
 **Device capability panel**
 - The device dropdown shows each output's supported sample rates and formats (queried from PipeWire).
+- The output list refreshes quietly every 5 s: (re)connected devices appear
+  (logged as "Device connected") without stealing your selection, and
+  disconnects are logged after a sustained absence (brief blips ignored).
+
+**Active input streams in the log**
+- The watcher logs the active input streams whenever the set stably changes
+  ("Active input streams: Firefox [48000Hz]." / "... none."), independent of
+  the autowatch switch, so the log always shows what the app reacted to.
 
 **Themeable log**
 - Log entries colored by level: **error** (red), **warn** (orange), **info** (white), **debug** (light blue).

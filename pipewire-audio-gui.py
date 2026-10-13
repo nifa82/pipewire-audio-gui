@@ -521,6 +521,12 @@ def load_streams():
         if not isinstance(desc, str):
             desc = name
         rates = sorted({r for _, r in enumerate_audio(obj, "EnumFormat") if r is not None})
+        if not rates:
+            # Some streams (e.g. browser playback) expose only the negotiated
+            # Format, not an EnumFormat list. Without this fallback their rate
+            # is invisible: the label shows "rate n/a" and the watcher never
+            # reacts to them.
+            rates = sorted({r for _, r in enumerate_audio(obj, "Format") if r is not None})
         streams.append({"id": obj.get("id"), "name": name, "desc": desc, "rates": rates})
     return streams
 
@@ -617,8 +623,9 @@ def current_graph_rate():
     return graph_rate_from(status)
 
 
-def active_input_rate():
-    streams = load_streams()
+def active_input_rate(streams=None):
+    if streams is None:
+        streams = load_streams()
     rates = []
     for s in streams:
         stream_rates = [r for r in s.get("rates") or [] if isinstance(r, int)]
@@ -1567,6 +1574,12 @@ class MainWindow(Gtk.Window):
         self._last_watch_ok = True
         self._pending_key = None
         self._pending_count = 0
+        self._last_device_ids = set()
+        self._device_missing = {}
+        self._combo_device_names = []
+        self._streams_pending_sig = None
+        self._streams_pending_count = 0
+        self._last_streams_sig = None
 
         self.build_ui()
         self.build_mapping_rows()
@@ -1577,6 +1590,9 @@ class MainWindow(Gtk.Window):
             self.log("Tray unavailable (%s); running window-only." % e)
         self.refresh()
         self.watch_source = GLib.timeout_add(2000, self.watcher_tick)
+        # Quiet output-device refresh: picks up USB DAC (re)connects without
+        # clobbering the user's selection. Must return True to stay alive.
+        self.devices_source = GLib.timeout_add(5000, self.refresh_devices_tick)
 
     def build_ui(self):
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -1884,10 +1900,9 @@ class MainWindow(Gtk.Window):
             self.log("Could not save mapping to %s: %s" % (path, err))
         return ok
 
-    def refresh(self):
-        self.devices, err = load_devices()
-        if err:
-            self.log("pw-dump error: %s" % err)
+    def rebuild_device_combo(self, preserve_selection):
+        """Rebuild the device dropdown, optionally keeping the selection."""
+        current = self.device_combo.get_active_id() if preserve_selection else None
         self.device_combo.remove_all()
         for i, dev in enumerate(self.devices):
             if dev["format"] and dev["rate"]:
@@ -1896,15 +1911,71 @@ class MainWindow(Gtk.Window):
                 state = "not negotiated (%s)" % (dev["state"] or "idle")
             label = "%s  (%s)" % (dev["desc"], state)
             self.device_combo.append(dev["name"], label)
-        if self.devices:
+        self._combo_device_names = [dev["name"] for dev in self.devices]
+        names = {dev["name"] for dev in self.devices}
+        if current in names:
+            # Same id: no "changed" fires, so refresh the info panel by hand.
+            self.device_combo.set_active_id(current)
+            self.on_device_changed(self.device_combo)
+        elif self.devices:
             self.device_combo.set_active(0)
         else:
+            self.info_label.set_text("No audio output devices found.")
+
+    def refresh(self):
+        self.devices, err = load_devices()
+        if err:
+            self.log("pw-dump error: %s" % err)
+        else:
+            self._last_device_ids = {
+                d.get("device_id") or d.get("name") for d in self.devices
+            }
+            self._device_missing = {}
+        self.rebuild_device_combo(False)
+        if not self.devices:
             self.info_label.set_text(
                 "No audio output devices found.\nerror: %s" % (err or "empty pw-dump output")
             )
         self.refresh_streams()
         self.update_global_label()
         self.restore_mode_state()
+
+    def refresh_devices_tick(self):
+        """5s quiet refresh: follow (re)connects, never steal the selection."""
+        try:
+            devices, err = load_devices()
+        except Exception:
+            return True
+        if err:
+            return True
+        present = {d.get("device_id") or d.get("name") for d in devices}
+        previous = self._last_device_ids or set()
+        for dev_id in present:
+            self._device_missing.pop(dev_id, None)
+        for dev_id in previous - present:
+            if dev_id not in self._device_missing:
+                self._device_missing[dev_id] = 0
+        # Only forget applied settings after a sustained absence, so a brief
+        # blip (or our own WirePlumber restart) does not drop them. Counters
+        # must be walked directly: once an id drops out of `previous` it
+        # would otherwise never reach the threshold.
+        for dev_id in list(self._device_missing):
+            if dev_id in present:
+                continue
+            self._device_missing[dev_id] += 1
+            if self._device_missing[dev_id] >= 3:
+                self._applied_devices.discard(dev_id)
+                del self._device_missing[dev_id]
+                self.log("Device disconnected: %s." % dev_id)
+        for dev in devices:
+            dev_id = dev.get("device_id") or dev.get("name")
+            if dev_id and dev_id not in previous:
+                self.log("Device connected: %s." % dev.get("desc", dev_id))
+        self._last_device_ids = present
+        self.devices = devices
+        if [d["name"] for d in devices] != self._combo_device_names:
+            self.rebuild_device_combo(True)
+        return True
 
     def restore_mode_state(self):
         mode, rate = read_rate_config()
@@ -2115,9 +2186,11 @@ class MainWindow(Gtk.Window):
                 self._apply_device_settings(dev, saved)
                 self._applied_devices.add(dev_id)
 
+        streams = load_streams()
+        self._watch_streams(streams)
         if not self.autowatch:
             return True
-        rate = active_input_rate()
+        rate = active_input_rate(streams)
         if not rate:
             self._last_watch_key = None
             self._pending_key = None
@@ -2198,6 +2271,44 @@ class MainWindow(Gtk.Window):
                 self.log("%s FAILED: %s" % (msg, fail), level="error")
                 notify_send("PipeWire Audio", msg + " FAILED", "critical")
         return okay
+
+    def _watch_streams(self, streams):
+        """Log the active input streams when the set stably changes.
+
+        Runs regardless of the autowatch switch: this is visibility, not
+        applying. Debounced like rate decisions so flickering streams
+        cannot flood the log.
+        """
+        sig = tuple(
+            sorted(
+                (s.get("desc", ""), tuple(s.get("rates") or [])) for s in streams
+            )
+        )
+        if sig != self._streams_pending_sig:
+            self._streams_pending_sig = sig
+            self._streams_pending_count = 1
+            return
+        self._streams_pending_count += 1
+        if self._streams_pending_count < _WATCH_STABLE_TICKS:
+            return
+        if self._last_streams_sig is None:
+            # First stable sighting: baseline silently, don't announce startup.
+            self._last_streams_sig = sig
+            return
+        if sig != self._last_streams_sig:
+            self._last_streams_sig = sig
+            if not sig:
+                self.log("Active input streams: none.")
+            else:
+                parts = [
+                    "%s [%s]"
+                    % (
+                        desc,
+                        ", ".join("%dHz" % r for r in rates) if rates else "rate n/a",
+                    )
+                    for desc, rates in sig
+                ]
+                self.log("Active input streams: %s." % "; ".join(parts))
 
     def _apply_device_settings(self, dev, saved):
         """Re-apply stored format/buffer rules for a (re)connected device."""
