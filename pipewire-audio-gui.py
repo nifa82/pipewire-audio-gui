@@ -962,15 +962,26 @@ def set_autostart(enabled):
 
 
 def notify_send(summary, body, urgency="normal"):
-    """Send a desktop notification if notify-send is available."""
+    """Send a desktop notification. Returns (ok, message).
+
+    The exit status is checked: notify-send can exist yet fail (no session
+    bus, blocked by the desktop), and subprocess.run without check=True
+    would report that as success.
+    """
     path = shutil.which("notify-send")
     if not path:
-        return False
+        return False, "notify-send not installed"
     try:
-        subprocess.run([path, "-u", urgency, summary, body], timeout=5)
-        return True
-    except Exception:
-        return False
+        proc = subprocess.run(
+            [path, "-u", urgency, summary, body],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:
+        return False, str(e)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return False, detail or "exit %d" % proc.returncode
+    return True, ""
 
 
 def parse_rgb(value):
@@ -1801,6 +1812,14 @@ class MainWindow(Gtk.Window):
         log_frame.add(scroll)
         log_page.pack_start(log_frame, True, True, 0)
 
+        log_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        test_notify_btn = Gtk.Button(label="Test notification")
+        test_notify_btn.set_tooltip_text("Send a test desktop notification")
+        test_notify_btn.connect("clicked", lambda w: self.on_test_notification())
+        log_btns.pack_start(test_notify_btn, False, False, 0)
+        log_btns.pack_start(Gtk.Label(label=""), True, True, 0)
+        log_page.pack_start(log_btns, False, False, 0)
+
         notebook.append_page(page_rate, Gtk.Label(label="Samplerate & Bitrate"))
         notebook.append_page(page_map, Gtk.Label(label="Samplerate mapping"))
         notebook.append_page(log_page, Gtk.Label(label="Log"))
@@ -2268,10 +2287,14 @@ class MainWindow(Gtk.Window):
         if not quiet:
             if okay:
                 self.log(msg)
-                notify_send("PipeWire Audio", msg, "normal")
+                sent, send_err = notify_send("PipeWire Audio", msg, "normal")
+                if not sent:
+                    self.log("Notification failed: %s." % send_err, level="warn")
             else:
                 self.log("%s FAILED: %s" % (msg, fail), level="error")
-                notify_send("PipeWire Audio", msg + " FAILED", "critical")
+                sent, send_err = notify_send("PipeWire Audio", msg + " FAILED", "critical")
+                if not sent:
+                    self.log("Notification failed: %s." % send_err, level="warn")
         return okay
 
     def _watch_streams(self, streams):
@@ -2441,6 +2464,15 @@ class MainWindow(Gtk.Window):
     def on_autostart_toggled(self, btn):
         set_autostart(btn.get_active())
         self.log("Autostart %s." % ("enabled" if btn.get_active() else "disabled"))
+
+    def on_test_notification(self):
+        sent, err = notify_send(
+            "PipeWire Audio Settings", "Notifications are working.", "normal"
+        )
+        if sent:
+            self.log("Test notification sent.")
+        else:
+            self.log("Test notification failed: %s." % err, level="warn")
 
     def toggle_window(self):
         if self.get_visible():
