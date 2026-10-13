@@ -669,6 +669,8 @@ def parse_clock_value(raw):
     text = (raw or "").strip()
     if re.fullmatch(r"-?\d+", text):
         return int(text)
+    if re.fullmatch(r"-?\d+\.0+", text):
+        return int(float(text))
     if text.startswith("[") and text.endswith("]"):
         values = [as_int(x) for x in re.findall(r"-?\d+", text)]
         values = [v for v in values if v is not None]
@@ -689,13 +691,14 @@ def load_clock_status():
 
 
 def graph_rate_from(clock):
-    """The rate the graph clock is actually running at.
+    """The rate the graph clock is actually running at, or 0 if unknown.
 
-    ``default.audio.rate`` is only the default handed to *newly created* streams;
-    it does not move an already-running graph. ``clock.rate`` is the live clock,
-    and ``clock.force-rate`` overrides it when set.
+    Only live keys count: ``clock.force-rate`` (when set) and ``clock.rate``.
+    ``default.audio.rate`` is deliberately NOT a fallback - it is the static
+    default for new streams, and treating it as live makes every decision
+    blind on systems where the live keys read differently.
     """
-    for key in ("clock.force-rate", "clock.rate", "default.audio.rate"):
+    for key in ("clock.force-rate", "clock.rate"):
         value = clock.get(key)
         if isinstance(value, int) and value > 0:
             return value
@@ -2066,7 +2069,8 @@ class MainWindow(Gtk.Window):
         else:
             state = "automatic (not forced)"
         self.global_label.set_text(
-            "Global clock: %s | clock.rate = %dHz" % (state, default)
+            "Global clock: %s | clock.rate = %s"
+            % (state, ("%dHz" % default) if default > 0 else "unknown")
         )
 
     def on_rate_preset(self, combo):
