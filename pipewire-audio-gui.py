@@ -7,9 +7,11 @@ Requires: python3-gobject, gtk3, pipewire, pipewire-tools, wireplumber
     python3 pipewire-audio-gui.py
 """
 
+import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -68,21 +70,7 @@ KDE_COLOR_DIRS = [
     "/usr/share/color-schemes",
 ]
 
-KDE_LOOKANDFEEL_DIRS = [
-    os.path.join(CONFIG_HOME, "plasma/look-and-feel"),
-    os.path.expanduser("~/.local/share/plasma/look-and-feel"),
-    os.path.expanduser("~/.plasma/look-and-feel"),
-    "/usr/local/share/plasma/look-and-feel",
-    "/usr/share/plasma/look-and-feel",
-]
 
-KDE_PLASMA_THEME_DIRS = [
-    os.path.join(CONFIG_HOME, "plasma/themes"),
-    os.path.expanduser("~/.local/share/plasma/themes"),
-    os.path.expanduser("~/.plasma/themes"),
-    "/usr/local/share/plasma/themes",
-    "/usr/share/plasma/themes",
-]
 
 RATES = [8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
 AUTO_RATES = [44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
@@ -181,7 +169,7 @@ def device_accepts_rate(dev, rate):
     """
     if not isinstance(rate, int) or rate <= 0:
         return False
-    if rate in dev.get("rates") or []:
+    if rate in (dev.get("rates") or []):
         return True
     return any(lo <= rate <= hi for lo, hi in dev.get("ranges") or [])
 
@@ -588,7 +576,8 @@ def save_mapping(mapping, autowatch, devices=None):
 
 def get_device_settings(devices, device_id):
     """Return saved settings for a device_id, or empty dict."""
-    return devices.get(device_id, {})
+    entry = devices.get(device_id, {})
+    return entry if isinstance(entry, dict) else {}
 
 
 
@@ -865,15 +854,6 @@ def read_file(path):
         return None
 
 
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-            return True
-    except OSError:
-        return False
-    return False
-
-
 def remove_format_config():
     removed = []
     for path in (WP_JSON_FILE, WP_LUA_FILE):
@@ -884,7 +864,6 @@ def remove_format_config():
 
 def write_buffer_config(device_name, buffer_size, api="alsa"):
     """Write a WirePlumber rule setting the ALSA period size for a device."""
-    import json as _json
     os.makedirs(WP_JSON_DIR, exist_ok=True)
     os.makedirs(WP_LUA_DIR, exist_ok=True)
     lua_code = (
@@ -908,7 +887,7 @@ def write_buffer_config(device_name, buffer_size, api="alsa"):
         },
     }
     safe_write(WP_JSON_FILE.replace("51-user-device-format", "52-user-buffer-size"),
-               _json.dumps(rule_json, indent=2) + "\n")
+               json.dumps(rule_json, indent=2) + "\n")
     safe_write(WP_LUA_FILE.replace("51-user-device-format", "52-user-buffer-size"),
                lua_code + "\n")
     return restart_services(["wireplumber.service"])
@@ -916,12 +895,11 @@ def write_buffer_config(device_name, buffer_size, api="alsa"):
 
 def remove_buffer_config():
     """Remove the user buffer size rule."""
-    import glob as _glob
     for pat in [
         WP_JSON_DIR + "/52-user-buffer-size*",
         WP_LUA_DIR + "/52-user-buffer-size*",
     ]:
-        for f in _glob.glob(pat):
+        for f in glob.glob(pat):
             remove_file(f)
     return restart_services(["wireplumber.service"])
 
@@ -1080,8 +1058,6 @@ def kde_colors_to_css(roles):
         or win.get("DecorationFocus")
         or sel_bg
     )
-    positive = win.get("ForegroundPositive", (40, 160, 60))
-    negative = win.get("ForegroundNegative", (200, 40, 40))
     title_bg = wm.get("activeBackground", window_bg)
     title_fg = wm.get("activeForeground", window_fg)
     title_bg_inactive = wm.get("inactiveBackground", window_bg)
@@ -1828,6 +1804,9 @@ class MainWindow(Gtk.Window):
         outer.pack_start(footer, False, False, 0)
 
     def log(self, text, level="info"):
+        # NOTE: TextBuffer.insert(iter, text, len) takes a length, not a tag -
+        # tags go through insert_with_tags_by_name. Passing a tag name as `len`
+        # raises TypeError, so never use insert() for tagged text.
         try:
             stamp = datetime.now().strftime("%H:%M:%S")
             end_iter = self.log_buffer.get_end_iter()
@@ -1839,8 +1818,10 @@ class MainWindow(Gtk.Window):
                 self.log_buffer.create_tag("log_info", foreground="white")
                 self.log_buffer.create_tag("log_debug", foreground="lightblue")
             tag = "log_" + level
-            self.log_buffer.insert(end_iter, "[%s] " % stamp, "log_info")
-            self.log_buffer.insert(end_iter, text + "\n", tag)
+            if tag not in ("log_error", "log_warn", "log_info", "log_debug"):
+                tag = "log_info"
+            self.log_buffer.insert_with_tags_by_name(end_iter, "[%s] " % stamp, -1, "log_info")
+            self.log_buffer.insert_with_tags_by_name(end_iter, text + "\n", -1, tag)
             self.log_view.scroll_to_iter(end_iter, 0.0, 0.0, 1.0)
         except Exception:
             pass
@@ -1930,40 +1911,6 @@ class MainWindow(Gtk.Window):
                     note = "  |  device does not support these rates -> resampled"
             lines.append("  %s  [%s]%s" % (s["desc"], rates, note))
         self.streams_label.set_text("\n".join(lines))
-
-    def update_device_caps(self):
-        dev = self.selected_device()
-        if not dev:
-            self.dev_caps_rates.set_text("Supported rates: (select a device)")
-            self.dev_caps_formats.set_text("Supported formats: (select a device)")
-            return
-        rates = dev.get("rates") or []
-        formats = dev.get("formats") or []
-        if rates:
-            self.dev_caps_rates.set_text("Supported rates: %s" % ", ".join("%d Hz" % r for r in rates))
-        else:
-            self.dev_caps_rates.set_text("Supported rates: (unknown)")
-        if formats:
-            self.dev_caps_formats.set_text("Supported formats: %s" % ", ".join(formats))
-        else:
-            self.dev_caps_formats.set_text("Supported formats: (unknown)")
-
-    def update_device_caps(self):
-        dev = self.selected_device()
-        if not dev:
-            self.dev_caps_rates.set_text("Supported rates: (select a device)")
-            self.dev_caps_formats.set_text("Supported formats: (select a device)")
-            return
-        rates = dev.get("rates") or []
-        formats = dev.get("formats") or []
-        if rates:
-            self.dev_caps_rates.set_text("Supported rates: %s" % ", ".join("%d Hz" % r for r in rates))
-        else:
-            self.dev_caps_rates.set_text("Supported rates: (unknown)")
-        if formats:
-            self.dev_caps_formats.set_text("Supported formats: %s" % ", ".join(formats))
-        else:
-            self.dev_caps_formats.set_text("Supported formats: (unknown)")
 
     def update_global_label(self):
         status, err = load_clock_status()
@@ -2068,7 +2015,11 @@ class MainWindow(Gtk.Window):
                 current = int(next_preset(int(key), 1))
             self.mapping[key] = current
             action, target = self.map_rows[key]
+            # Don't retrigger on_map_target_changed: the value is already
+            # stored, and the handler would duplicate the save/log lines.
+            self.loading_mapping = True
             target.set_active_id(str(current))
+            self.loading_mapping = False
             target.set_sensitive(True)
         self.save_mapping_quiet()
         self.log("Mapping %sHz -> %s" % (key, self.mapping[key]))
@@ -2164,6 +2115,8 @@ class MainWindow(Gtk.Window):
                 msg = "Auto: input %dHz -> rescaled to %dHz." % (rate, target)
                 self.log(msg)
                 notify_send("PipeWire Audio", msg, "low")
+        # Returning True keeps the 2s timeout alive; None/False would run once.
+        return True
 
     def _apply_device_settings(self, dev, saved):
         """Re-apply stored format/buffer rules for a (re)connected device."""
@@ -2460,7 +2413,7 @@ class MainWindow(Gtk.Window):
             self.log("No device selected.")
             return
         dev_name = dev.get("name", "")
-        api = dev.get("api", "alsa")
+        api = dev.get("api", "alsa") or "alsa"
         buf = self.buffer_combo.get_active_id() or "256"
         rc, out, err = write_buffer_config(dev_name, buf, api)
         if rc != 0:
