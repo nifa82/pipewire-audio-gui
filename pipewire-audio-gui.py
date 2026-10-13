@@ -1559,6 +1559,8 @@ class MainWindow(Gtk.Window):
         self.loading_mapping = False
 
         self.mapping, self.autowatch, self.devices_saved = load_mapping()
+        self._last_watch_key = None
+        self._last_watch_ok = True
 
         self.build_ui()
         self.build_mapping_rows()
@@ -1810,18 +1812,35 @@ class MainWindow(Gtk.Window):
         try:
             stamp = datetime.now().strftime("%H:%M:%S")
             end_iter = self.log_buffer.get_end_iter()
-            # Color tags for themeable log
-            if not hasattr(self, "_log_tags_setup"):
-                self._log_tags_setup = True
-                self.log_buffer.create_tag("log_error", foreground="red", weight=700)
-                self.log_buffer.create_tag("log_warn", foreground="orange", weight=600)
-                self.log_buffer.create_tag("log_info", foreground="white")
-                self.log_buffer.create_tag("log_debug", foreground="lightblue")
+            # Color tags for the log. The flag is set only after the tags
+            # really exist, so a one-off failure retries next call instead of
+            # disabling colored (or any) logging forever.
+            if not getattr(self, "_log_tags_setup", False):
+                try:
+                    self.log_buffer.create_tag("log_error", foreground="red")
+                    self.log_buffer.create_tag("log_warn", foreground="orange")
+                    self.log_buffer.create_tag("log_debug", foreground="gray")
+                    self._log_tags_setup = True
+                except Exception:
+                    pass
             tag = "log_" + level
-            if tag not in ("log_error", "log_warn", "log_info", "log_debug"):
-                tag = "log_info"
-            self.log_buffer.insert_with_tags_by_name(end_iter, "[%s] " % stamp, -1, "log_info")
-            self.log_buffer.insert_with_tags_by_name(end_iter, text + "\n", -1, tag)
+            # info (and anything unknown) uses the theme's own text color:
+            # hardcoded white is invisible on light themes.
+            try:
+                if tag in ("log_error", "log_warn", "log_debug") and getattr(
+                    self, "_log_tags_setup", False
+                ):
+                    self.log_buffer.insert_with_tags_by_name(
+                        end_iter, "[%s] " % stamp, -1, tag
+                    )
+                    self.log_buffer.insert_with_tags_by_name(
+                        end_iter, text + "\n", -1, tag
+                    )
+                else:
+                    self.log_buffer.insert(end_iter, "[%s] %s\n" % (stamp, text))
+            except Exception:
+                # Last resort: plain text is always better than no text.
+                self.log_buffer.insert(end_iter, "[%s] %s\n" % (stamp, text))
             self.log_view.scroll_to_iter(end_iter, 0.0, 0.0, 1.0)
         except Exception:
             pass
@@ -2094,29 +2113,73 @@ class MainWindow(Gtk.Window):
             return True
         rate = active_input_rate()
         if not rate:
+            self._last_watch_key = None
             return True
         target = resolve_target(rate, self.mapping)
+        key = (rate, target)
+        if key != self._last_watch_key:
+            # New situation: act, and tell the user exactly once.
+            self._last_watch_key = key
+            self._last_watch_ok = self._apply_watch_target(rate, target, quiet=False)
+            return True
+        if not self._last_watch_ok:
+            # Last attempt failed: keep retrying silently until the
+            # situation changes instead of spamming notifications.
+            self._last_watch_ok = self._apply_watch_target(rate, target, quiet=True)
+            return True
+        # Same situation, applied cleanly: only act if the graph drifted
+        # (e.g. a device reconnected), and stay silent about it.
+        current = current_graph_rate()
+        expected = target if target is not None else rate
+        if current != 0 and current != expected:
+            self._last_watch_ok = self._apply_watch_target(rate, target, quiet=True)
+        # Returning True keeps the 2s timeout alive; None/False would run once.
+        return True
+
+    def _apply_watch_target(self, rate, target, quiet=False):
+        """Carry out one watch decision. Returns True on success.
+
+        Already-converged graphs are left alone (no log, no notification).
+        Failures are reported once via the loud path; quiet retries stay
+        silent so a stuck graph can never flood the desktop.
+        """
         current = current_graph_rate()
         if target is None:
             allowed = allowed_rates_for(self.mapping)
             if rate not in allowed:
                 allowed = sorted(set(allowed) | {rate})
-                set_allowed_rates(allowed)
-            if current != rate:
-                set_default_rate(rate)
-                force_rate(None)
-                msg = "Auto: input %dHz -> bit-perfect." % rate
-                self.log(msg)
-                notify_send("PipeWire Audio", msg, "low")
+                rc, _, err = set_allowed_rates(allowed)
+                if rc != 0 and not quiet:
+                    self.log("allowed-rates failed: %s" % err, level="error")
+            if current == rate:
+                return True
+            okay, fail = True, ""
+            rc, _, err = set_default_rate(rate)
+            if rc != 0:
+                okay, fail = False, err
+            rc, _, err = force_rate(None)
+            if rc != 0:
+                okay, fail = False, err
+            msg = "Auto: input %dHz -> bit-perfect." % rate
         else:
-            if current != target:
-                set_default_rate(target)
-                force_rate(target)
-                msg = "Auto: input %dHz -> rescaled to %dHz." % (rate, target)
+            if current == target:
+                return True
+            okay, fail = True, ""
+            rc, _, err = set_default_rate(target)
+            if rc != 0:
+                okay, fail = False, err
+            rc, _, err = force_rate(target)
+            if rc != 0:
+                okay, fail = False, err
+            msg = "Auto: input %dHz -> rescaled to %dHz." % (rate, target)
+        if not quiet:
+            if okay:
                 self.log(msg)
                 notify_send("PipeWire Audio", msg, "low")
-        # Returning True keeps the 2s timeout alive; None/False would run once.
-        return True
+            else:
+                self.log("%s FAILED: %s" % (msg, fail), level="error")
+                notify_send("PipeWire Audio", msg + " FAILED", "critical")
+        return okay
 
     def _apply_device_settings(self, dev, saved):
         """Re-apply stored format/buffer rules for a (re)connected device."""
