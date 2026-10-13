@@ -2281,6 +2281,8 @@ class MainWindow(Gtk.Window):
                 if rc != 0 and not quiet:
                     self.log("allowed-rates failed: %s" % err, level="error")
             if current == rate:
+                if not quiet:
+                    self.log("Watch: input %dHz already active, nothing to do." % rate)
                 return True
             okay, fail = True, ""
             rc, _, err = set_default_rate(rate)
@@ -2292,6 +2294,8 @@ class MainWindow(Gtk.Window):
             msg = "Auto: input %dHz -> bit-perfect." % rate
         else:
             if current == target:
+                if not quiet:
+                    self.log("Watch: input %dHz already active, nothing to do." % rate)
                 return True
             okay, fail = True, ""
             rc, _, err = set_default_rate(target)
