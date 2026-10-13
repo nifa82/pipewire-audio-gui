@@ -27,9 +27,14 @@
     <binary>pipewire-audio-gui</binary>
   </provides>
   <releases>
+    <release version="1.3.1" date="2026-10-13">
+      <description>
+        <p>Remove profiles/presets and CLI profile commands; trim dead code.</p>
+      </description>
+    </release>
     <release version="1.3.0" date="2026-10-12">
       <description>
-        <p>Initial release.</p>
+        <p>Profiles/presets, CLI mode, themeable log, profile UI.</p>
       </description>
     </release>
   </releases>

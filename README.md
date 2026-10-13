@@ -56,17 +56,6 @@ including automatic per-rate bit-perfect/rescaling and background auto-apply.
 **Device capability panel**
 - The device dropdown shows each output's supported sample rates and formats (queried from PipeWire).
 
-**Profiles / Presets**
-- Built-in profiles: **Gaming** (bit-perfect at common rates), **Music** (all rates bit-perfect), **Recording** (high rates bit-perfect).
-- Create custom profiles: **Save As…** stores current mapping + autowatch + device settings.
-- **Apply / Save As… / Delete / Import / Export** buttons for full profile management.
-- Profiles stored as JSON in `~/.config/pipewire-audio-gui/profiles/`.
-
-**CLI mode**
-- `--list-profiles` — list all profiles
-- `--apply-profile NAME` — apply a profile and exit (no GUI)
-- `--export-profile NAME` — export profile JSON to stdout
-
 **Themeable log**
 - Log entries colored by level: **error** (red), **warn** (orange), **info** (white), **debug** (light blue).
 
@@ -126,8 +115,8 @@ python3 pipewire-audio-gui.py
 # build tarball
 ./packaging/make-tarball.sh
 # extract & install
-tar -xzf packaging/dist/pipewire-audio-gui-1.3.0.tar.gz -C /tmp
-/tmp/pipewire-audio-gui-1.3.0/install.sh --user
+tar -xzf packaging/dist/pipewire-audio-gui-1.3.1.tar.gz -C /tmp
+/tmp/pipewire-audio-gui-1.3.1/install.sh --user
 # run
 pipewire-audio-gui
 ```
