@@ -97,6 +97,7 @@ The window is tabbed: **Samplerate & Bitrate**, **Samplerate mapping** and **Log
 | GTK3 typelib | introspection | `typelib-1_0-Gtk-3_0` | `gtk3` | `gir1.2-gtk-3.0` | `gtk3` |
 | `pipewire` + tools | audio graph + `pw-cli` | `pipewire pipewire-tools` | `pipewire` | `pipewire` | `pipewire` |
 | `wireplumber` | session manager | `wireplumber` | `wireplumber` | `wireplumber` | `wireplumber` |
+| `notify-send` | desktop notifications (optional) | `libnotify-tools` | `libnotify` | `libnotify-bin` | `libnotify` |
 
 **Tray icon (background auto-apply):** install the AppIndicator typelib.
 

@@ -2268,7 +2268,7 @@ class MainWindow(Gtk.Window):
         if not quiet:
             if okay:
                 self.log(msg)
-                notify_send("PipeWire Audio", msg, "low")
+                notify_send("PipeWire Audio", msg, "normal")
             else:
                 self.log("%s FAILED: %s" % (msg, fail), level="error")
                 notify_send("PipeWire Audio", msg + " FAILED", "critical")
@@ -2654,6 +2654,13 @@ def main():
     theme, dark, colors = follow_system_theme()
     win = MainWindow()
     win.log("PipeWire Audio Settings %s started." % APP_VERSION)
+    if not shutil.which("notify-send"):
+        win.log(
+            "Desktop notifications unavailable: install libnotify-tools "
+            "(openSUSE), libnotify (Fedora/Arch) or libnotify-bin "
+            "(Debian/Ubuntu).",
+            level="warn",
+        )
     win.log(
         "Following system theme: %s%s."
         % (
