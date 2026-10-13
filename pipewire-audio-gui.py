@@ -73,6 +73,10 @@ KDE_COLOR_DIRS = [
 
 
 RATES = [8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
+# Watch decisions must hold for this many consecutive 2s ticks before the app
+# acts on them. Kills notification spam from flickering input rates at the
+# cost of a short delay on genuine changes.
+_WATCH_STABLE_TICKS = 2
 AUTO_RATES = [44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
 
 BITPERFECT = "bitperfect"
@@ -1561,6 +1565,8 @@ class MainWindow(Gtk.Window):
         self.mapping, self.autowatch, self.devices_saved = load_mapping()
         self._last_watch_key = None
         self._last_watch_ok = True
+        self._pending_key = None
+        self._pending_count = 0
 
         self.build_ui()
         self.build_mapping_rows()
@@ -2114,9 +2120,21 @@ class MainWindow(Gtk.Window):
         rate = active_input_rate()
         if not rate:
             self._last_watch_key = None
+            self._pending_key = None
+            self._pending_count = 0
             return True
         target = resolve_target(rate, self.mapping)
         key = (rate, target)
+        # Debounce: input rates can flicker (a stream vanishing for a tick
+        # looks like silence-then-new-rate). Act only once a decision holds
+        # for consecutive ticks, so flicker never applies or notifies.
+        if key != self._pending_key:
+            self._pending_key = key
+            self._pending_count = 1
+            return True
+        self._pending_count += 1
+        if self._pending_count < _WATCH_STABLE_TICKS:
+            return True
         if key != self._last_watch_key:
             # New situation: act, and tell the user exactly once.
             self._last_watch_key = key
