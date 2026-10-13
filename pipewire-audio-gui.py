@@ -1602,6 +1602,7 @@ class MainWindow(Gtk.Window):
         self.mapping, self.autowatch, self.devices_saved = load_mapping()
         self._last_watch_key = None
         self._last_watch_ok = True
+        self._watch_stuck = 0
         self._pending_key = None
         self._pending_count = 0
         self._last_device_ids = set()
@@ -2250,11 +2251,13 @@ class MainWindow(Gtk.Window):
             # New situation: act, and tell the user exactly once.
             self._last_watch_key = key
             self._last_watch_ok = self._apply_watch_target(rate, target, quiet=False)
+            self._watch_stuck = 0
             return True
         if not self._last_watch_ok:
             # Last attempt failed: keep retrying silently until the
             # situation changes instead of spamming notifications.
             self._last_watch_ok = self._apply_watch_target(rate, target, quiet=True)
+            self._watch_stuck = 0
             return True
         # Same situation, applied cleanly: only act if the graph drifted
         # (e.g. a device reconnected), and stay silent about it.
@@ -2262,6 +2265,18 @@ class MainWindow(Gtk.Window):
         expected = target if target is not None else rate
         if current != 0 and current != expected:
             self._last_watch_ok = self._apply_watch_target(rate, target, quiet=True)
+            self._watch_stuck += 1
+            if self._watch_stuck == 3:
+                # Commands succeed but the graph never moves: notifying again
+                # would be a lie, so explain once instead.
+                self.log(
+                    "Graph did not follow to %dHz (still %dHz). The output "
+                    "device may be fixed-rate, or clock.force-rate may be "
+                    "stuck - check `pw-metadata -n settings 0`." % (expected, current),
+                    level="warn",
+                )
+        else:
+            self._watch_stuck = 0
         # Returning True keeps the 2s timeout alive; None/False would run once.
         return True
 
