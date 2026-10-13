@@ -1610,7 +1610,6 @@ class MainWindow(Gtk.Window):
         self._last_watch_key = None
         self._last_watch_ok = True
         self._watch_stuck = 0
-        self._idle_released = False
         self._pending_key = None
         self._pending_count = 0
         self._last_device_ids = set()
@@ -2240,17 +2239,14 @@ class MainWindow(Gtk.Window):
             return True
         rate = active_input_rate(streams)
         if not rate:
+            # Silence: forget the last decision so a returning stream
+            # re-applies, but do NOT release the force. Releasing would drop
+            # the graph back to the default and make the next switch in that
+            # direction a silent no-op (asymmetric notifications).
             self._last_watch_key = None
             self._pending_key = None
             self._pending_count = 0
-            if not self._idle_released:
-                self._idle_released = True
-                _, saved_rate = read_rate_config()
-                set_default_rate(saved_rate or 48000)
-                force_rate(None)
-                self.log("No input streams; released rate forcing.")
             return True
-        self._idle_released = False
         target = resolve_target(rate, self.mapping)
         key = (rate, target)
         # Debounce: input rates can flicker (a stream vanishing for a tick
