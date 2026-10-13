@@ -529,7 +529,8 @@ def load_streams():
             # is invisible: the label shows "rate n/a" and the watcher never
             # reacts to them.
             rates = sorted({r for _, r in enumerate_audio(obj, "Format") if r is not None})
-        streams.append({"id": obj.get("id"), "name": name, "desc": desc, "rates": rates})
+        streams.append({"id": obj.get("id"), "name": name, "desc": desc,
+                        "rates": rates, "state": get_state(obj)})
     return streams
 
 
@@ -625,11 +626,27 @@ def current_graph_rate():
     return graph_rate_from(status)
 
 
+def _stream_rates_text(rates, state):
+    """'48000Hz' / '48000Hz, suspended' / 'rate n/a' for labels and the log."""
+    text = ", ".join("%dHz" % r for r in rates) if rates else "rate n/a"
+    if state and state != "running" and text != "rate n/a":
+        text += ", %s" % state
+    elif state and state != "running":
+        text = state
+    return text
+
+
 def active_input_rate(streams=None):
     if streams is None:
         streams = load_streams()
     rates = []
     for s in streams:
+        state = s.get("state") or ""
+        # Paused/suspended streams stay in the graph; counting them pins the
+        # max at a stale rate and the app never follows the playing source.
+        # Unknown state ("") still counts (backward compatible).
+        if state and state != "running":
+            continue
         stream_rates = [r for r in s.get("rates") or [] if isinstance(r, int)]
         if stream_rates:
             rates.append(max(stream_rates))
@@ -2016,7 +2033,7 @@ class MainWindow(Gtk.Window):
             return
         lines = ["Active input streams:"]
         for s in streams:
-            rates = ", ".join("%dHz" % r for r in s["rates"]) if s["rates"] else "rate n/a"
+            rates = _stream_rates_text(s["rates"], s.get("state") or "")
             note = ""
             if dev and dev["rates"] and s["rates"]:
                 direct = [r for r in s["rates"] if device_accepts_rate(dev, r)]
@@ -2306,7 +2323,8 @@ class MainWindow(Gtk.Window):
         """
         sig = tuple(
             sorted(
-                (s.get("desc", ""), tuple(s.get("rates") or [])) for s in streams
+                (s.get("desc", ""), tuple(s.get("rates") or []), s.get("state") or "")
+                for s in streams
             )
         )
         if sig != self._streams_pending_sig:
@@ -2326,12 +2344,8 @@ class MainWindow(Gtk.Window):
                 self.log("Active input streams: none.")
             else:
                 parts = [
-                    "%s [%s]"
-                    % (
-                        desc,
-                        ", ".join("%dHz" % r for r in rates) if rates else "rate n/a",
-                    )
-                    for desc, rates in sig
+                    "%s [%s]" % (desc, _stream_rates_text(rates, state))
+                    for desc, rates, state in sig
                 ]
                 self.log("Active input streams: %s." % "; ".join(parts))
 
