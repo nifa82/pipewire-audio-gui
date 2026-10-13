@@ -800,13 +800,17 @@ def apply_rate_runtime(mode, rate):
 def apply_mapping_runtime(input_rate, mapping):
     target = resolve_target(input_rate, mapping)
     if target is None:
+        # Bit-perfect means the graph runs AT the input rate. Setting the
+        # default and releasing the force does NOT move an already-running
+        # graph (verified: clock.rate stays put), so pin it explicitly. The
+        # pin is overwritten by the next switch and released on silence.
         allowed = allowed_rates_for(mapping)
         if input_rate not in allowed:
             allowed = sorted(set(allowed) | {input_rate})
         return [
             ("allowed-rates", set_allowed_rates(allowed)),
             ("default.audio.rate", set_default_rate(input_rate)),
-            ("release force-rate (bit-perfect)", force_rate(None)),
+            ("force-rate %d (bit-perfect)" % input_rate, force_rate(input_rate)),
         ]
     return [
         ("default.audio.rate", set_default_rate(target)),
@@ -1606,6 +1610,7 @@ class MainWindow(Gtk.Window):
         self._last_watch_key = None
         self._last_watch_ok = True
         self._watch_stuck = 0
+        self._idle_released = False
         self._pending_key = None
         self._pending_count = 0
         self._last_device_ids = set()
@@ -2238,7 +2243,14 @@ class MainWindow(Gtk.Window):
             self._last_watch_key = None
             self._pending_key = None
             self._pending_count = 0
+            if not self._idle_released:
+                self._idle_released = True
+                _, saved_rate = read_rate_config()
+                set_default_rate(saved_rate or 48000)
+                force_rate(None)
+                self.log("No input streams; released rate forcing.")
             return True
+        self._idle_released = False
         target = resolve_target(rate, self.mapping)
         key = (rate, target)
         # Debounce: input rates can flicker (a stream vanishing for a tick
@@ -2307,7 +2319,7 @@ class MainWindow(Gtk.Window):
             rc, _, err = set_default_rate(rate)
             if rc != 0:
                 okay, fail = False, err
-            rc, _, err = force_rate(None)
+            rc, _, err = force_rate(rate)
             if rc != 0:
                 okay, fail = False, err
             msg = "Auto: input %dHz -> bit-perfect." % rate
