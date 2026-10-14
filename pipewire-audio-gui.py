@@ -71,7 +71,6 @@ KDE_COLOR_DIRS = [
 ]
 
 
-
 RATES = [8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
 # Watch decisions must hold for this many consecutive 2s ticks before the app
 # acts on them. Kills notification spam from flickering input rates at the
@@ -80,6 +79,7 @@ _WATCH_STABLE_TICKS = 2
 AUTO_RATES = [44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
 
 APP_VERSION = "1.4.0"
+AUTOSTART_FILE = "pipewire-audio-gui.desktop"
 
 BITPERFECT = "bitperfect"
 ACTION_BITPERFECT = "bp"
@@ -248,6 +248,24 @@ def pod_alternatives(value):
     return out or pod_alternatives(value.get("default"))
 
 
+def param_entries(obj):
+    """Normalise a node's params into a list of {"id", "info"} entries.
+
+    pw-dump renders params either as a mapping (keyed by id) or as a list of
+    dicts; every consumer needs the list shape.
+    """
+    params = get_params(obj)
+    if not isinstance(params, dict):
+        return list(params or [])
+    entries = []
+    for key, value in params.items():
+        # In the mapping shape the value is the entry itself, so an embedded
+        # "info" has to be unwrapped; otherwise the value *is* the info.
+        info = value.get("info") if isinstance(value, dict) and "info" in value else value
+        entries.append({"id": key, "info": info})
+    return entries
+
+
 def rate_ranges(obj):
     """(min, max) sample-rate ranges a device accepts, from EnumFormat.
 
@@ -258,11 +276,7 @@ def rate_ranges(obj):
     would wrongly report that rate as unsupported.
     """
     out = []
-    params = get_params(obj)
-    if isinstance(params, dict):
-        entries = [{"id": key, "info": info} for key, info in params.items()]
-    else:
-        entries = list(params or [])
+    entries = param_entries(obj)
     for p in entries:
         if not isinstance(p, dict) or p.get("id") != "EnumFormat":
             continue
@@ -291,11 +305,7 @@ def enumerate_audio(obj, param_id):
     ...}`` entry and the older nested ``{"audio": {...}}`` entry, with plain
     scalars or ``{default, alt1, ...}`` descriptions.
     """
-    params = get_params(obj)
-    if isinstance(params, dict):
-        entries = [{"id": key, "info": info} for key, info in params.items()]
-    else:
-        entries = list(params or [])
+    entries = param_entries(obj)
     for p in entries:
         if not isinstance(p, dict) or p.get("id") != param_id:
             continue
@@ -364,11 +374,7 @@ def format_rate_matrix(obj):
     {format: {"rates": [...], "ranges": [(lo, hi), ...]}}.
     """
     out = {}
-    params = get_params(obj)
-    if isinstance(params, dict):
-        entries = [{"id": key, "info": info} for key, info in params.items()]
-    else:
-        entries = list(params or [])
+    entries = param_entries(obj)
     for p in entries:
         if not isinstance(p, dict) or p.get("id") != "EnumFormat":
             continue
@@ -593,7 +599,6 @@ def get_device_settings(devices, device_id):
     return entry if isinstance(entry, dict) else {}
 
 
-
 def resolve_target(input_rate, mapping):
     action = mapping.get(str(input_rate), BITPERFECT)
     if action == BITPERFECT:
@@ -719,14 +724,12 @@ def set_allowed_rates(rates):
     return run(["pw-metadata", "-n", "settings", "0", "default.audio.allowed-rates", value])
 
 
-def spa_quote(value):
-    text = value if isinstance(value, str) else str(value)
-    text = text.replace("\\", "\\\\").replace('"', '\\"')
-    text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
-    return '"%s"' % text
+def config_quote(value):
+    """Quote a value for a WirePlumber config string.
 
-
-def lua_quote(value):
+    WirePlumber's SPA string and Lua literal escaping are identical, so a
+    single helper serves both the JSON (.conf) and Lua rule paths.
+    """
     text = value if isinstance(value, str) else str(value)
     text = text.replace("\\", "\\\\").replace('"', '\\"')
     text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
@@ -841,7 +844,7 @@ def write_format_config(device_name, fmt, api="alsa"):
     else:
         section = "monitor.alsa.rules"
     kind = wp_config_format()
-    name = spa_quote(device_name) if kind == "json" else lua_quote(device_name)
+    name = config_quote(device_name)
     if kind == "json":
         content = (
             "%s = [\n"
@@ -857,7 +860,7 @@ def write_format_config(device_name, fmt, api="alsa"):
             "            }\n"
             "        }\n"
             "    }\n"
-            "]\n" % (section, name, spa_quote(fmt))
+            "]\n" % (section, name, config_quote(fmt))
         )
         path = WP_JSON_FILE
     else:
@@ -877,7 +880,7 @@ def write_format_config(device_name, fmt, api="alsa"):
             "        },\n"
             "    },\n"
             "}\n"
-            % (table, table, table, table, table, table, name, lua_quote(fmt))
+            % (table, table, table, table, table, table, name, config_quote(fmt))
         )
         path = WP_LUA_FILE
     return safe_write(path, content)
@@ -950,38 +953,49 @@ def restart_services(names):
     return run(cmd)
 
 
+def autostart_dir():
+    """Where the session reads autostart .desktop files from.
+
+    Honours XDG_CONFIG_HOME, but falls back to the real ~/.config when the
+    configured home is a sandbox/Flatpak directory - the same reasoning as
+    kde_config_home(): an entry written there would never be seen.
+    """
+    homes = [CONFIG_HOME, os.path.expanduser("~/.config")]
+    for base in homes:
+        if os.path.isdir(os.path.join(base, "autostart")):
+            return os.path.join(base, "autostart")
+    return os.path.join(homes[0], "autostart")
 
 
 def is_autostart_enabled():
-    """Check if autostart .desktop exists."""
-    desktop = os.path.join(os.path.expanduser("~/.config/autostart"), "pipewire-audio-gui.desktop")
-    return os.path.isfile(desktop)
+    """Check if the autostart .desktop entry exists."""
+    return os.path.isfile(os.path.join(autostart_dir(), AUTOSTART_FILE))
 
 
 def set_autostart(enabled):
-    """Enable or disable autostart via .desktop in ~/.config/autostart."""
-    autostart_dir = os.path.join(os.path.expanduser("~/.config/autostart"))
-    desktop_path = os.path.join(autostart_dir, "pipewire-audio-gui.desktop")
+    """Enable or disable autostart via a .desktop entry."""
+    directory = autostart_dir()
+    desktop_path = os.path.join(directory, AUTOSTART_FILE)
     try:
         if enabled:
-            os.makedirs(autostart_dir, exist_ok=True)
-            exe = shutil.which("pipewire-audio-gui") or os.path.join(os.path.expanduser("~/.local/bin"), "pipewire-audio-gui")
+            os.makedirs(directory, exist_ok=True)
+            exe = shutil.which("pipewire-audio-gui") or os.path.join(
+                os.path.expanduser("~/.local/bin"), "pipewire-audio-gui"
+            )
             content = (
                 "[Desktop Entry]\n"
                 "Type=Application\n"
                 "Name=PipeWire Audio Settings\n"
-                "Exec={exe}\n"
+                "Exec=%s\n"
                 "Terminal=false\n"
-                "X-GNOME-Autostart-enabled=true\n"
-            ).format(exe=exe)
+                "X-GNOME-Autostart-enabled=true\n" % exe
+            )
             with open(desktop_path, "w") as f:
                 f.write(content)
         else:
-            if os.path.exists(desktop_path):
-                os.remove(desktop_path)
+            remove_file(desktop_path)
         return True
-    except Exception as e:
-        print("Autostart error:", e)
+    except OSError:
         return False
 
 
@@ -1573,7 +1587,6 @@ def current_gtk_theme():
         return settings.get_property("gtk-theme-name") or ""
     except Exception:
         return ""
-
 
 
 class MainWindow(Gtk.Window):
@@ -2295,55 +2308,36 @@ class MainWindow(Gtk.Window):
     def _apply_watch_target(self, rate, target, quiet=False):
         """Carry out one watch decision. Returns True on success.
 
-        Already-converged graphs are left alone (no log, no notification).
-        Failures are reported once via the loud path; quiet retries stay
-        silent so a stuck graph can never flood the desktop.
+        An already-converged graph is left alone. Failures are reported once
+        via the loud path; quiet retries stay silent so a stuck graph can
+        never flood the desktop.
         """
-        current = current_graph_rate()
-        if target is None:
-            allowed = allowed_rates_for(self.mapping)
-            if rate not in allowed:
-                allowed = sorted(set(allowed) | {rate})
-                rc, _, err = set_allowed_rates(allowed)
-                if rc != 0 and not quiet:
-                    self.log("allowed-rates failed: %s" % err, level="error")
-            if current == rate:
-                if not quiet:
-                    self.log("Watch: input %dHz already active, nothing to do." % rate)
-                return True
-            okay, fail = True, ""
-            rc, _, err = set_default_rate(rate)
+        expected = target if target is not None else rate
+        if current_graph_rate() == expected:
+            if not quiet:
+                self.log("Watch: input %dHz already active, nothing to do." % rate)
+            return True
+        fail = ""
+        for label, (rc, out, err) in apply_mapping_runtime(rate, self.mapping):
             if rc != 0:
-                okay, fail = False, err
-            rc, _, err = force_rate(rate)
-            if rc != 0:
-                okay, fail = False, err
-            msg = "Auto: input %dHz -> bit-perfect." % rate
-        else:
-            if current == target:
-                if not quiet:
-                    self.log("Watch: input %dHz already active, nothing to do." % rate)
-                return True
-            okay, fail = True, ""
-            rc, _, err = set_default_rate(target)
-            if rc != 0:
-                okay, fail = False, err
-            rc, _, err = force_rate(target)
-            if rc != 0:
-                okay, fail = False, err
-            msg = "Auto: input %dHz -> rescaled to %dHz." % (rate, target)
-        if not quiet:
-            if okay:
-                self.log(msg)
-                sent, send_err = notify_send("PipeWire Audio", msg, "normal")
-                if not sent:
-                    self.log("Notification failed: %s." % send_err, level="warn")
-            else:
-                self.log("%s FAILED: %s" % (msg, fail), level="error")
-                sent, send_err = notify_send("PipeWire Audio", msg + " FAILED", "critical")
-                if not sent:
-                    self.log("Notification failed: %s." % send_err, level="warn")
-        return okay
+                fail = "%s: %s" % (label, err or out)
+                break
+        if quiet:
+            return not fail
+        what = (
+            "bit-perfect" if target is None
+            else "rescaled to %dHz" % target
+        )
+        msg = "Auto: input %dHz -> %s." % (rate, what)
+        if fail:
+            msg += " FAILED (%s)" % fail
+        self.log(msg, level="error" if fail else "info")
+        sent, send_err = notify_send(
+            "PipeWire Audio", msg, "critical" if fail else "normal"
+        )
+        if not sent:
+            self.log("Notification failed: %s." % send_err, level="warn")
+        return not fail
 
     def _watch_streams(self, streams):
         """Log the active input streams when the set stably changes.
@@ -2385,10 +2379,11 @@ class MainWindow(Gtk.Window):
         name = dev.get("name", "")
         api = dev.get("api", "alsa") or "alsa"
         if "format" in saved:
-            rc, _, err = write_format_config(name, saved["format"], api)
+            # write_*_config report success as a bool, run() as rc==0: don't mix.
+            ok, _, err = write_format_config(name, saved["format"], api)
             self.log(
                 "Re-applied saved format %s for %s." % (saved["format"], name)
-                if rc == 0
+                if ok
                 else "Could not re-apply format for %s: %s" % (name, err)
             )
         if "buffer_size" in saved:
@@ -2617,12 +2612,10 @@ class MainWindow(Gtk.Window):
             if rc != 0:
                 self.log("%s failed: %s" % (label, err or out))
         self.log("Wrote %s (mode=%s, rate=%d)." % (path, mode, rate))
-        rc, out, err = restart_services(["pipewire.service", "pipewire-pulse.service"])
-        if rc == 0:
-            self.log("PipeWire restarted.")
-        else:
-            self.log("PipeWire restart failed: %s" % (err or out))
-        GLib.timeout_add(1500, self.refresh)
+        self._restart_and_refresh(
+            ["pipewire.service", "pipewire-pulse.service"], "PipeWire",
+            "PipeWire restarted.",
+        )
 
     def on_reset_rate(self):
         force_rate(None)
@@ -2631,12 +2624,10 @@ class MainWindow(Gtk.Window):
             self.log("Removed %s and released force-rate." % PW_RATE_FILE)
         else:
             self.log("Released clock.force-rate (runtime).")
-        rc, out, err = restart_services(["pipewire.service", "pipewire-pulse.service"])
-        if rc == 0:
-            self.log("PipeWire restarted.")
-        else:
-            self.log("PipeWire restart failed: %s" % (err or out))
-        GLib.timeout_add(1500, self.refresh)
+        self._restart_and_refresh(
+            ["pipewire.service", "pipewire-pulse.service"], "PipeWire",
+            "PipeWire restarted.",
+        )
 
     def on_save_format(self):
         dev = self.selected_device()
@@ -2656,12 +2647,11 @@ class MainWindow(Gtk.Window):
             return
         self.log("Wrote %s (device=%s, format=%s)." % (path, dev["name"], fmt))
         self._remember_device(dev, "format", fmt)
-        rc, out, err = restart_services(["wireplumber.service"])
-        if rc == 0:
-            self.log("WirePlumber restarted; format should now be %s for %s." % (fmt, dev["desc"]))
-        else:
-            self.log("WirePlumber restart failed: %s" % (err or out))
-        GLib.timeout_add(1500, self.refresh)
+        self._restart_and_refresh(
+            ["wireplumber.service"], "WirePlumber",
+            "WirePlumber restarted; format should now be %s for %s."
+            % (fmt, dev["desc"]),
+        )
 
     def on_reset_format(self):
         self._forget_device_key("format")
@@ -2670,12 +2660,10 @@ class MainWindow(Gtk.Window):
             self.log("Removed %s." % ", ".join(removed))
         else:
             self.log("No custom format file to remove.")
-        rc, out, err = restart_services(["wireplumber.service"])
-        if rc == 0:
-            self.log("WirePlumber restarted; device format back to automatic.")
-        else:
-            self.log("WirePlumber restart failed: %s" % (err or out))
-        GLib.timeout_add(1500, self.refresh)
+        self._restart_and_refresh(
+            ["wireplumber.service"], "WirePlumber",
+            "WirePlumber restarted; device format back to automatic.",
+        )
 
     def on_save_buffer(self):
         """Save buffer size for the selected device and restart WirePlumber."""
@@ -2704,15 +2692,26 @@ class MainWindow(Gtk.Window):
             self.log("Buffer size reset to default; WirePlumber restarted.")
         self.refresh_streams()
 
-    def restart_pipewire(self):
-        rc, out, err = restart_services(["pipewire.service", "pipewire-pulse.service"])
-        self.log("Restart PipeWire: %s" % ("OK" if rc == 0 else (err or out)))
+    def _restart_and_refresh(self, services, label, ok_msg):
+        """Restart services, log the outcome, refresh the UI once up again."""
+        rc, out, err = restart_services(services)
+        if rc == 0:
+            self.log(ok_msg)
+        else:
+            self.log("%s restart failed: %s" % (label, err or out))
         GLib.timeout_add(1500, self.refresh)
+        return rc == 0
+
+    def restart_pipewire(self):
+        self._restart_and_refresh(
+            ["pipewire.service", "pipewire-pulse.service"], "PipeWire",
+            "Restart PipeWire: OK.",
+        )
 
     def restart_wireplumber(self):
-        rc, out, err = restart_services(["wireplumber.service"])
-        self.log("Restart WirePlumber: %s" % ("OK" if rc == 0 else (err or out)))
-        GLib.timeout_add(1500, self.refresh)
+        self._restart_and_refresh(
+            ["wireplumber.service"], "WirePlumber", "Restart WirePlumber: OK."
+        )
 
 
 def main():
