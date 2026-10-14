@@ -1,6 +1,6 @@
 # PipeWire Audio Settings (GTK3)
 
-> **Note:** This application was developed with the assistance of AI (OpenCode / Nemotron-3-Ultra).
+> **Note:** This application was developed with the assistance of AI (OpenCode).
 
 A GTK3 GUI for Linux to control PipeWire audio **sample rate** and **bit depth**,
 including automatic per-rate bit-perfect/rescaling and background auto-apply.
