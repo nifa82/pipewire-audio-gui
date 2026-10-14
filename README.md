@@ -158,6 +158,26 @@ EOF
 With auto-start enabled the app lives in the tray and applies your mapping
 whenever the input sample rate changes.
 
+## Tests
+
+53 regression tests, no display or PipeWire required (GTK is stubbed and the
+`pw-*` commands are intercepted):
+
+```sh
+python3 tests/test_pipewire_audio_gui.py          # or
+python3 -m unittest discover -s tests
+```
+
+They pin the behaviour that has actually broken: `mapping.json` staying valid
+JSON, the log view really rendering, the watcher keeping its GLib timeout and
+notifying exactly once per *real* rate change in both directions, bit-perfect
+forcing the graph rate, paused streams not pinning the rate, per-device
+save/re-apply/reset for USB DACs, and the Plasma config lookup.
+
+The GTK stub in `tests/gtk_stub.py` deliberately raises on unknown methods and
+rejects a tag name passed where GTK expects a length, so a bad call or a
+regression like the silently-empty log fails the suite instead of shipping.
+
 ## Config files it manages
 
 | Purpose | File |
